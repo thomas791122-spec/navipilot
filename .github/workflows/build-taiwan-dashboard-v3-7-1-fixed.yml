@@ -1,0 +1,644 @@
+name: Build NaviPilot Taiwan Dashboard v3.7.1 (Manifest fix + adaptive map)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout NaviPilot source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install Android toolchains
+        shell: bash
+        run: |
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;26.1.10909125' 'cmake;3.22.1'
+          yes | sdkmanager --licenses > /dev/null || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Inject independent read-only dashboard
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashState.kt)"
+          cat > app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashState.kt <<'TW_DASH_EOF_0'
+          package com.jixiexiaoge.drivingassist
+
+          import android.content.Context
+
+          /** Isolated read-only navigation state; it does not publish to 7706/7714 or change cruise control. */
+          internal object TaiwanDashState {
+              private const val PREF = "taiwan_dashboard_v37"
+              private fun p(c: Context) = c.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+
+              fun enabled(c: Context): Boolean = p(c).getBoolean("enabled", false)
+              fun start(c: Context) {
+                  p(c).edit().putBoolean("enabled", true).putLong("started", System.currentTimeMillis()).apply()
+                  log(c, "START")
+              }
+              fun stop(c: Context, reason: String) {
+                  p(c).edit().putBoolean("enabled", false).putBoolean("has_nav", false).apply()
+                  log(c, "STOP $reason")
+              }
+              fun update(c: Context, title: String, road: String, extra: String, id: Int) {
+                  if (!enabled(c)) return
+                  val old = p(c)
+                  val changed = old.getString("title", "") != title || old.getString("road", "") != road || old.getString("extra", "") != extra
+                  old.edit().putString("title", title.take(160)).putString("road", road.take(200))
+                      .putString("extra", extra.take(220)).putLong("last_nav", System.currentTimeMillis())
+                      .putInt("last_id", id).putBoolean("has_nav", true).apply()
+                  if (changed && (System.currentTimeMillis() - old.getLong("last_logged", 0L) > 4000L)) {
+                      old.edit().putLong("last_logged", System.currentTimeMillis()).apply()
+                      log(c, "GOOGLE $title | $road | $extra")
+                  }
+              }
+              fun navRemoved(c: Context, id: Int) {
+                  if (!enabled(c) || p(c).getInt("last_id", Int.MIN_VALUE) != id) return
+                  p(c).edit().putBoolean("has_nav", false).putLong("removed_at", System.currentTimeMillis()).apply()
+              }
+              fun lastNavMs(c: Context) = p(c).getLong("last_nav", 0L)
+              fun hasNav(c: Context) = p(c).getBoolean("has_nav", false)
+              fun nav(c: Context): Triple<String, String, String> = Triple(
+                  p(c).getString("title", "").orEmpty(), p(c).getString("road", "").orEmpty(), p(c).getString("extra", "").orEmpty()
+              )
+              fun log(c: Context, item: String) {
+                  val now = System.currentTimeMillis()
+                  val value = "$now ${item.replace('\n', ' ').take(260)}\n"
+                  val old = p(c).getString("log", "").orEmpty()
+                  p(c).edit().putString("log", (old + value).takeLast(6000)).apply()
+              }
+              fun logs(c: Context) = p(c).getString("log", "目前沒有紀錄").orEmpty()
+          }
+          TW_DASH_EOF_0
+          mkdir -p "$(dirname app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashListener.kt)"
+          cat > app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashListener.kt <<'TW_DASH_EOF_1'
+          package com.jixiexiaoge.drivingassist
+
+          import android.app.Notification
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import android.os.Handler
+          import android.os.Looper
+          import java.io.File
+          import java.io.FileOutputStream
+
+          /** Receives Google Maps public notification fields; never requests driving control. */
+          class TaiwanDashListener : NotificationListenerService() {
+              private val mainHandler = Handler(Looper.getMainLooper())
+              private var pendingEnd: Runnable? = null
+              private var lastIconMs = 0L
+              private var lastErrorMs = 0L
+
+              override fun onNotificationPosted(sbn: StatusBarNotification?) {
+                  if (sbn?.packageName != "com.google.android.apps.maps" || !TaiwanDashState.enabled(this)) return
+                  pendingEnd?.let { mainHandler.removeCallbacks(it) }; pendingEnd = null
+                  try {
+                      val n = sbn.notification
+                      val extras = n.extras
+                      fun t(key: String): String = runCatching { extras?.getCharSequence(key)?.toString().orEmpty() }.getOrDefault("")
+                      val title = t(Notification.EXTRA_TITLE)
+                      val road = t(Notification.EXTRA_TEXT)
+                      val sub = t(Notification.EXTRA_SUB_TEXT)
+                      if (title.isBlank() && road.isBlank()) return
+                      TaiwanDashState.update(this, title, road, sub, sbn.id)
+                      saveSmallIcon(n)
+                  } catch (e: RuntimeException) {
+                      val now = System.currentTimeMillis()
+                      if (now - lastErrorMs > 30_000L) {
+                          lastErrorMs = now
+                          TaiwanDashState.log(this, "NOTIFY_ERROR ${e.javaClass.simpleName}: ${e.message.orEmpty().take(80)}")
+                      }
+                  }
+              }
+
+              private fun saveSmallIcon(n: Notification) {
+                  val now = System.currentTimeMillis()
+                  if (now - lastIconMs < 2500L) return
+                  lastIconMs = now
+                  try {
+                      val drawable = n.smallIcon?.loadDrawable(this) ?: return
+                      val picture = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888)
+                      val canvas = Canvas(picture)
+                      drawable.setBounds(0, 0, 96, 96)
+                      drawable.draw(canvas)
+                      val temp = File(filesDir, "tw_turn.tmp")
+                      FileOutputStream(temp).use { picture.compress(Bitmap.CompressFormat.PNG, 75, it) }
+                      val dst = File(filesDir, "tw_turn.png")
+                      if (!temp.renameTo(dst)) { temp.copyTo(dst, overwrite = true); temp.delete() }
+                      picture.recycle()
+                  } catch (_: Exception) { /* Decorative icon is optional. */ }
+              }
+
+              override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+                  if (sbn?.packageName != "com.google.android.apps.maps") return
+                  TaiwanDashState.navRemoved(this, sbn.id)
+                  pendingEnd?.let { mainHandler.removeCallbacks(it) }
+                  val task = Runnable {
+                      val staleMs = System.currentTimeMillis() - TaiwanDashState.lastNavMs(this)
+                      if (TaiwanDashState.enabled(this) && !TaiwanDashState.hasNav(this) && staleMs > 90_000L) {
+                          TaiwanDashState.stop(this, "navigation_notification_ended")
+                      }
+                  }
+                  pendingEnd = task
+                  mainHandler.postDelayed(task, 95_000L)
+              }
+              override fun onDestroy() {
+                  pendingEnd?.let { mainHandler.removeCallbacks(it) }
+                  super.onDestroy()
+              }
+          }
+          TW_DASH_EOF_1
+          mkdir -p "$(dirname app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashActivity.kt)"
+          cat > app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashActivity.kt <<'TW_DASH_EOF_2'
+          package com.jixiexiaoge.drivingassist
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.res.Configuration
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.location.Location
+          import android.location.LocationListener
+          import android.location.LocationManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.io.File
+          import java.net.URI
+          import java.net.URL
+          import kotlin.concurrent.thread
+          import kotlin.math.roundToInt
+
+          /** Responsive, read-only dashboard. Does not implement a Carrot speed-control protocol. */
+          class TaiwanDashActivity : Activity() {
+              private val bg = Color.rgb(9, 17, 30)
+              private val panelColor = Color.rgb(22, 35, 54)
+              private val textSoft = Color.rgb(172, 194, 224)
+              private val blue = Color.rgb(35, 121, 223)
+              private val handler = Handler(Looper.getMainLooper())
+              private lateinit var screen: LinearLayout
+              private lateinit var content: LinearLayout
+              private lateinit var cameraPanel: LinearLayout
+              private lateinit var mapPanel: LinearLayout
+              private lateinit var carrot: WebView
+              private lateinit var map: WebView
+              private lateinit var banner: TextView
+              private lateinit var status: TextView
+              private lateinit var cameraStatus: TextView
+              private lateinit var turnIcon: ImageView
+              private lateinit var cameraInfo: TextView
+              private lateinit var startBtn: Button
+              private lateinit var stopBtn: Button
+              private var lastIconModified = 0L
+              private var lastPosition: Location? = null
+              private var gpsStarted = false
+              private var mapReady = false
+              private var cameraLive = false
+              private var focused = false
+              private val points = mutableListOf<Camera>()
+              private data class Camera(val latitude: Double, val longitude: Double, val name: String, val limit: String)
+              private val gps = object : LocationListener {
+                  override fun onLocationChanged(location: Location) {
+                      lastPosition = location
+                      publishGps(location)
+                  }
+              }
+              private val refresh = object : Runnable {
+                  override fun run() {
+                      updateScreen()
+                      handler.postDelayed(this, if (TaiwanDashState.enabled(this@TaiwanDashActivity)) 1600L else 10000L)
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = bg
+                  window.navigationBarColor = bg
+                  locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
+                  screen = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(bg) }
+                  setContentView(screen)
+                  createPanels()
+                  renderLayout()
+                  loadCameras()
+              }
+              private lateinit var locationManager: LocationManager
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).roundToInt()
+              private fun shape(color: Int, radius: Int = 13) = GradientDrawable().apply { setColor(color); cornerRadius = dp(radius).toFloat() }
+              private fun text(label: String, sp: Float = 15f, color: Int = Color.WHITE): TextView = TextView(this).apply {
+                  this.text = label; textSize = sp; setTextColor(color); gravity = Gravity.CENTER_VERTICAL
+              }
+              private fun button(label: String, color: Int = panelColor, click: () -> Unit): Button = Button(this).apply {
+                  text = label; isAllCaps = false; textSize = 12.5f; setTextColor(Color.WHITE); background = shape(color, 11)
+                  setPadding(dp(3), 0, dp(3), 0); setOnClickListener { click() }
+              }
+              private fun pad(p: LinearLayout, n: Int = 7) = p.setPadding(dp(n), dp(n), dp(n), dp(n))
+
+              private fun createPanels() {
+                  cameraPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; background = shape(panelColor); pad(this) }
+                  mapPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; background = shape(panelColor); pad(this) }
+                  val cameraHead = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                  cameraHead.addView(text("Carrot Web 影像／胎壓", 16f).apply { setTypeface(null, Typeface.BOLD) }, LinearLayout.LayoutParams(0, dp(42), 1f))
+                  cameraHead.addView(button("連接 C4", blue) { connectCarrot() }, LinearLayout.LayoutParams(dp(91), dp(38)))
+                  cameraHead.addView(button("IP", panelColor) { editCarrotAddress() }, LinearLayout.LayoutParams(dp(42), dp(38)))
+                  cameraPanel.addView(cameraHead)
+                  carrot = WebView(this).apply {
+                      setBackgroundColor(Color.BLACK)
+                      settings.javaScriptEnabled = true
+                      settings.domStorageEnabled = true
+                      settings.allowFileAccess = false
+                      settings.allowContentAccess = false
+                      settings.setSupportZoom(true)
+                      settings.builtInZoomControls = false
+                      settings.mediaPlaybackRequiresUserGesture = false
+                      webViewClient = object : WebViewClient() {
+                          override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                              if (request == null || !request.isForMainFrame) return false
+                              return !isSameCarrot(request.url.toString())
+                          }
+                          override fun onPageFinished(view: WebView?, url: String?) { cameraStatus.text = if (url == "about:blank") "影像已關閉" else "Carrot Web 已載入；胎壓以車端實際畫面為準" }
+                      }
+                  }
+                  cameraPanel.addView(carrot, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                  cameraStatus = text("尚未連接 C4；請確認同一 Wi-Fi 與 IP", 11.5f, textSoft)
+                  cameraPanel.addView(cameraStatus, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(26)))
+
+                  val mapHead = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; orientation = LinearLayout.HORIZONTAL }
+                  turnIcon = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setBackgroundColor(Color.TRANSPARENT) }
+                  mapHead.addView(turnIcon, LinearLayout.LayoutParams(dp(54), dp(68)))
+                  banner = text("Google 地圖尚未開始導航", 15f)
+                  banner.setTypeface(null, Typeface.BOLD)
+                  banner.setPadding(dp(8), 0, dp(2), 0)
+                  mapHead.addView(banner, LinearLayout.LayoutParams(0, dp(78), 1f))
+                  mapPanel.addView(mapHead)
+                  map = WebView(this).apply {
+                      setBackgroundColor(Color.rgb(18, 27, 45))
+                      settings.javaScriptEnabled = true
+                      settings.domStorageEnabled = false
+                      settings.allowFileAccess = false
+                      settings.allowContentAccess = false
+                      // Identifies the application when requesting OSM tiles; do not prefetch tiles.
+                      settings.userAgentString = settings.userAgentString + " NaviPilotTaiwan/3.7"
+                      webViewClient = object : WebViewClient() {
+                          override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = true
+                          override fun onPageFinished(view: WebView?, url: String?) {
+                              mapReady = true
+                              lastPosition?.let { publishGps(it) }
+                          }
+                      }
+                      val html = assets.open("tw_dashboard_map.html").bufferedReader().use { it.readText() }
+                      // HTTPS base creates a normal origin and Referer for map tiles.
+                      loadDataWithBaseURL("https://github.com/thomas791122-spec/navipilot/", html, "text/html", "UTF-8", null)
+                  }
+                  mapPanel.addView(map, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                  val zoomRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; orientation = LinearLayout.HORIZONTAL }
+                  zoomRow.addView(button("－") { map.evaluateJavascript("setZoom(-1)", null) }, LinearLayout.LayoutParams(dp(46), dp(37)))
+                  zoomRow.addView(button("＋") { map.evaluateJavascript("setZoom(1)", null) }, LinearLayout.LayoutParams(dp(46), dp(37)))
+                  cameraInfo = text("測速資料未載入（只供警示，不控制減速）", 11.5f, textSoft).apply { maxLines = 2 }
+                  zoomRow.addView(cameraInfo, LinearLayout.LayoutParams(0, dp(46), 1f))
+                  mapPanel.addView(zoomRow)
+              }
+
+              private fun renderLayout() {
+                  screen.removeAllViews()
+                  val horizontal = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                  val titleRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; pad(this, 7) }
+                  val title = text("NaviPilot Taiwan", if (horizontal) 18f else 16f).apply { setTypeface(null, Typeface.BOLD) }
+                  titleRow.addView(title, LinearLayout.LayoutParams(0, dp(40), 1f))
+                  status = text("唯讀／GPS 地圖／Google 通知", 11f, textSoft)
+                  titleRow.addView(status)
+                  screen.addView(titleRow)
+                  content = LinearLayout(this).apply { orientation = if (horizontal) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL; pad(this, 4) }
+                  screen.addView(content, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                  (cameraPanel.parent as? ViewGroup)?.removeView(cameraPanel)
+                  (mapPanel.parent as? ViewGroup)?.removeView(mapPanel)
+                  if (focused) {
+                      content.addView(cameraPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                  } else if (horizontal) {
+                      content.addView(cameraPanel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.15f).apply { rightMargin = dp(5) })
+                      content.addView(mapPanel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+                  } else {
+                      content.addView(cameraPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.46f).apply { bottomMargin = dp(5) })
+                      content.addView(mapPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.54f))
+                  }
+                  val footer = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; pad(this, 5) }
+                  startBtn = button("▶ 開始", blue) {
+                      TaiwanDashState.start(this)
+                      startGps()
+                      updateScreen()
+                  }
+                  stopBtn = button("■ 停止", Color.rgb(168, 43, 54)) { stopEverything("user_button") }
+                  footer.addView(startBtn, LinearLayout.LayoutParams(0, dp(48), 1f).apply { rightMargin = dp(3) })
+                  footer.addView(stopBtn, LinearLayout.LayoutParams(0, dp(48), 1f).apply { rightMargin = dp(3) })
+                  footer.addView(button(if (focused) "↩ 返回" else "▣ 影像") { focused = !focused; renderLayout() }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { rightMargin = dp(3) })
+                  footer.addView(button("⚙ 設定") { showOptions() }, LinearLayout.LayoutParams(0, dp(48), 1f))
+                  screen.addView(footer)
+                  updateScreen()
+              }
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  renderLayout() // Reuse existing WebViews, do not recreate streams on rotation.
+              }
+              private fun showOptions() {
+                  val items = arrayOf("更改 C4 IP", "匯入台灣測速 CSV", "下載官方固定測速資料", "授權 Google 地圖通知", "開啟 Google 地圖", "分享診斷 Log")
+                  AlertDialog.Builder(this).setTitle("NaviPilot 設定").setItems(items) { _, index ->
+                      when (index) {
+                          0 -> editCarrotAddress()
+                          1 -> startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*" }, 202)
+                          2 -> downloadCameras()
+                          3 -> startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                          4 -> startActivity(packageManager.getLaunchIntentForPackage("com.google.android.apps.maps") ?: Intent(Intent.ACTION_VIEW, Uri.parse("https://maps.google.com")))
+                          5 -> startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, TaiwanDashState.logs(this@TaiwanDashActivity)) }, "分享 NaviPilot Log"))
+                      }
+                  }.show()
+              }
+              private fun editCarrotAddress() {
+                  val entry = EditText(this).apply { setSingleLine(true); setText(getCarrotAddress()) }
+                  AlertDialog.Builder(this).setTitle("C4 區域網路網址（埠 7000）").setView(entry)
+                      .setPositiveButton("儲存") { _, _ ->
+                          val v = normalizeCarrot(entry.text.toString())
+                          if (v == null) Toast.makeText(this, "僅接受內網 HTTP 位址與埠 7000", Toast.LENGTH_LONG).show()
+                          else { getSharedPreferences("tw37", MODE_PRIVATE).edit().putString("carrot", v).apply(); connectCarrot() }
+                      }.setNegativeButton("取消", null).show()
+              }
+              private fun getCarrotAddress() = getSharedPreferences("tw37", MODE_PRIVATE).getString("carrot", "http://172.20.10.3:7000/").orEmpty()
+              private fun normalizeCarrot(text: String): String? {
+                  val candidate = text.trim().let { if (it.startsWith("http://")) it else "http://$it" }
+                  val uri = runCatching { URI(candidate) }.getOrNull() ?: return null
+                  val host = uri.host.orEmpty()
+                  val privateHost = host == "localhost" || host.startsWith("192.168.") || host.startsWith("10.") ||
+                      Regex("172\\.(1[6-9]|2[0-9]|3[01])\\.\\d{1,3}\\.\\d{1,3}").matches(host)
+                  if (uri.scheme != "http" || uri.port != 7000 || !privateHost || uri.userInfo != null) return null
+                  return "http://$host:7000/"
+              }
+              private fun isSameCarrot(url: String): Boolean {
+                  val src = runCatching { URI(normalizeCarrot(getCarrotAddress()) ?: return false) }.getOrNull() ?: return false
+                  val dest = runCatching { URI(url) }.getOrNull() ?: return false
+                  return src.scheme == dest.scheme && src.host == dest.host && dest.port == 7000
+              }
+              private fun connectCarrot() {
+                  if (!TaiwanDashState.enabled(this)) { TaiwanDashState.start(this); startGps() }
+                  val target = normalizeCarrot(getCarrotAddress())
+                  if (target == null) { cameraStatus.text = "C4 IP 無效，請點 IP 修改"; return }
+                  cameraLive = true
+                  cameraStatus.text = "連接 $target …"
+                  carrot.loadUrl(target)
+              }
+              private fun stopEverything(reason: String) {
+                  TaiwanDashState.stop(this, reason)
+                  stopGps()
+                  cameraLive = false
+                  carrot.stopLoading()
+                  carrot.loadUrl("about:blank")
+                  updateScreen()
+              }
+              private fun hasPermission() = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                  checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+              private fun startGps() {
+                  if (!TaiwanDashState.enabled(this) || gpsStarted) return
+                  if (!hasPermission()) {
+                      requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), 91)
+                      return
+                  }
+                  try {
+                      for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+                          if (provider == LocationManager.GPS_PROVIDER && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) continue
+                          if (!locationManager.isProviderEnabled(provider)) continue
+                          locationManager.requestLocationUpdates(provider, 1500L, 7f, gps)
+                          locationManager.getLastKnownLocation(provider)?.takeIf { System.currentTimeMillis() - it.time in 0..30_000 }?.let { gps.onLocationChanged(it) }
+                      }
+                      gpsStarted = true
+                  } catch (e: SecurityException) { TaiwanDashState.log(this, "GPS permission missing") }
+              }
+              private fun stopGps() {
+                  if (gpsStarted) runCatching { locationManager.removeUpdates(gps) }
+                  gpsStarted = false
+              }
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode == 91 && hasPermission()) startGps()
+              }
+              override fun onResume() {
+                  super.onResume()
+                  handler.removeCallbacks(refresh)
+                  handler.post(refresh)
+                  if (TaiwanDashState.enabled(this)) startGps()
+                  if (cameraLive) connectCarrot()
+              }
+              override fun onPause() {
+                  handler.removeCallbacks(refresh)
+                  stopGps() // Foreground-only GPS. No ongoing background location service.
+                  if (cameraLive) { carrot.onPause(); carrot.stopLoading(); carrot.loadUrl("about:blank") }
+                  super.onPause()
+              }
+              override fun onDestroy() {
+                  handler.removeCallbacks(refresh)
+                  stopGps()
+                  carrot.stopLoading(); carrot.destroy()
+                  map.stopLoading(); map.destroy()
+                  super.onDestroy()
+              }
+              private fun publishGps(l: Location) {
+                  if (!TaiwanDashState.enabled(this) || !mapReady || !l.latitude.isFinite() || !l.longitude.isFinite()) return
+                  if (l.hasAccuracy() && l.accuracy > 100f) return
+                  map.evaluateJavascript("update(${l.latitude},${l.longitude})", null)
+                  val snapshot = synchronized(points) { points.toList() }
+                  if (snapshot.isNotEmpty()) {
+                      val nearby = snapshot.map { item ->
+                          val distance = FloatArray(1)
+                          Location.distanceBetween(l.latitude, l.longitude, item.latitude, item.longitude, distance)
+                          item to distance[0]
+                      }
+                          .filter { it.second < 1500f }.sortedBy { it.second }.take(12)
+                      val pairs = nearby.joinToString(",", "[", "]") { "[${it.first.latitude},${it.first.longitude}]" }
+                      map.evaluateJavascript("setCameras($pairs)", null)
+                      cameraInfo.text = nearby.firstOrNull()?.let { "測速點約 ${it.second.roundToInt()}m｜限速 ${it.first.limit}｜僅直線距離" }
+                          ?: "前方 1.5km 範圍沒有鄰近測速點（未驗證道路）"
+                  }
+              }
+              private fun updateScreen() {
+                  if (!::status.isInitialized) return
+                  val running = TaiwanDashState.enabled(this)
+                  val nav = TaiwanDashState.nav(this)
+                  val age = System.currentTimeMillis() - TaiwanDashState.lastNavMs(this)
+                  status.text = if (running) "● 診斷中" else "○ 已停止"
+                  val fresh = running && age in 0..15_000
+                  banner.text = if (fresh) "${nav.first.ifBlank { "距離未知" }}｜${nav.second.ifBlank { "方向未知" }}\n${nav.third}" else "尚無新鮮 Google 地圖通知\n導航畫面與本地圖不是相同路線"
+                  val iconFile = File(filesDir, "tw_turn.png")
+                  if (fresh && iconFile.exists() && iconFile.lastModified() != lastIconModified) {
+                      lastIconModified = iconFile.lastModified()
+                      turnIcon.setImageBitmap(BitmapFactory.decodeFile(iconFile.absolutePath))
+                  } else if (!fresh) turnIcon.setImageDrawable(null)
+                  if (!running && cameraLive) { cameraLive = false; carrot.stopLoading(); carrot.loadUrl("about:blank") }
+                  if (!running && gpsStarted) stopGps()
+                  if (!fresh && running && TaiwanDashState.lastNavMs(this) != 0L && age > 5 * 60_000L && lastPosition?.speed?.let { it < 0.5f } == true) {
+                      stopEverything("idle_5min_stopped")
+                  }
+              }
+              private fun loadCameras() {
+                  val f = File(filesDir, "tw_cameras.csv")
+                  if (f.exists()) thread { runCatching { parseCsv(f.readText(Charsets.UTF_8)) } }
+              }
+              private fun parseCsv(s: String) {
+                  // RFC4180-like CSV parser, including quoted commas and escaped quotes.
+                  val rows = mutableListOf<List<String>>(); val row = mutableListOf<String>(); val cell = StringBuilder()
+                  var quoted = false; var i = 0
+                  while (i < s.length) {
+                      val c = s[i]
+                      when {
+                          c == '"' && quoted && i + 1 < s.length && s[i + 1] == '"' -> { cell.append('"'); i++ }
+                          c == '"' -> quoted = !quoted
+                          c == ',' && !quoted -> { row.add(cell.toString()); cell.setLength(0) }
+                          c == '\n' && !quoted -> { row.add(cell.toString().trimEnd('\r')); cell.setLength(0); rows.add(row.toList()); row.clear() }
+                          else -> cell.append(c)
+                      }
+                      i++
+                  }
+                  if (cell.isNotEmpty() || row.isNotEmpty()) { row.add(cell.toString()); rows.add(row.toList()) }
+                  if (rows.size < 2) return
+                  val header = rows.first().map { it.trim().removePrefix("\uFEFF").lowercase().replace(" ", "").replace("_", "") }
+                  fun idx(vararg names: String) = header.indexOfFirst { it in names }
+                  val lat = idx("latitude", "緯度", "座標緯度"); val lon = idx("longitude", "經度", "座標經度")
+                  if (lat < 0 || lon < 0) return
+                  val where = idx("address", "設置地址", "設置地點", "設置位置"); val limit = idx("limit", "速限", "速限-速度限制")
+                  val read = rows.drop(1).mapNotNull { r ->
+                      val a = r.getOrNull(lat)?.toDoubleOrNull() ?: return@mapNotNull null
+                      val b = r.getOrNull(lon)?.toDoubleOrNull() ?: return@mapNotNull null
+                      if (a !in 20.0..27.0 || b !in 117.0..124.0) return@mapNotNull null
+                      Camera(a, b, r.getOrNull(where).orEmpty(), r.getOrNull(limit).orEmpty())
+                  }
+                  synchronized(points) { points.clear(); points.addAll(read) }
+                  runOnUiThread { cameraInfo.text = "台灣測速資料 ${read.size} 筆（僅顯示，不介入減速）" }
+              }
+              private fun downloadCameras() {
+                  Toast.makeText(this, "下載測速資料中…", Toast.LENGTH_SHORT).show()
+                  thread {
+                      val data = runCatching {
+                          val conn = URL("https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/EA5E6FCD-B82D-43B7-A5CF-E9893253187E/resource/6D874102-9EB0-4C64-A64C-87A1ACE1D573/download").openConnection()
+                          conn.connectTimeout = 15000; conn.readTimeout = 18000
+                          conn.getInputStream().use { it.bufferedReader().readText() }.also { require(it.length < 6_000_000) }
+                      }
+                      data.onSuccess { File(filesDir, "tw_cameras.csv").writeText(it); parseCsv(it) }
+                          .onFailure { runOnUiThread { Toast.makeText(this, "下載失敗，請用匯入 CSV", Toast.LENGTH_LONG).show() } }
+                  }
+              }
+              @Deprecated("Android document-picker compatibility")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != 202 || resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+                  thread {
+                      runCatching {
+                          val csv = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: return@runCatching
+                          File(filesDir, "tw_cameras.csv").writeText(csv); parseCsv(csv)
+                      }.onFailure { runOnUiThread { Toast.makeText(this, "CSV 無法讀取", Toast.LENGTH_LONG).show() } }
+                  }
+              }
+          }
+          TW_DASH_EOF_2
+          mkdir -p "$(dirname app/src/main/assets/tw_dashboard_map.html)"
+          cat > app/src/main/assets/tw_dashboard_map.html <<'TW_DASH_EOF_3'
+          <!DOCTYPE html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><style>
+          html,body{margin:0;height:100%;background:#101a2c;color:#d9e7fa;font-family:system-ui;overflow:hidden}#map{position:relative;width:100%;height:100%;overflow:hidden;background:#111d2c}img.tile{position:absolute;width:256px;height:256px;border:0}#trace{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none}#cams{position:absolute;inset:0;pointer-events:none;z-index:6}.cam{position:absolute;width:14px;height:14px;background:#f04452;border:2px solid #fff;border-radius:50%;box-shadow:0 0 5px #f44;transform:translate(-50%,-50%)}#center{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:24px;height:24px;border-radius:50%;background:#328afa;border:4px solid white;box-shadow:0 0 0 10px #328afa44;z-index:8}#empty{position:absolute;left:12px;top:12px;padding:8px;background:#061020dd;border-radius:8px;z-index:9;font-size:13px}#credits{position:absolute;bottom:5px;right:8px;font-size:11px;z-index:12;background:#fffde;color:#111;padding:2px 5px;border-radius:4px}#legend{position:absolute;left:8px;bottom:7px;z-index:12;background:#101a2cce;border-radius:5px;padding:4px 6px;font-size:11px}
+          </style></head><body><div id="map"><div id="tiles"></div><svg id="trace"></svg><div id="cams"></div><div id="center"></div><div id="empty">等待 GPS 取得位置…</div><div id="legend">藍色軌跡＝已行駛，不是 Google 規劃路線</div><div id="credits">© OpenStreetMap contributors</div></div><script>
+          'use strict';let lat=null,lon=null,z=16,trail=[],cache={},cameras=[];const tiles=document.getElementById('tiles'),svg=document.getElementById('trace');
+          function project(a,b){let scale=256*Math.pow(2,z),sin=Math.sin(a*Math.PI/180);return {x:(b+180)/360*scale,y:(.5-Math.log((1+sin)/(1-sin))/(4*Math.PI))*scale};}
+          function update(a,b){if(!Number.isFinite(a)||!Number.isFinite(b)||Math.abs(a)>85||Math.abs(b)>180)return;lat=a;lon=b;document.getElementById('empty').style.display='none';let p=project(lat,lon);if(!trail.length||Math.abs(p.x-trail[trail.length-1].x)>8||Math.abs(p.y-trail[trail.length-1].y)>8){trail.push(p);if(trail.length>160)trail.shift();}render();}
+          function render(){if(lat===null)return;const w=tiles.parentElement.clientWidth,h=tiles.parentElement.clientHeight,p=project(lat,lon),tx=Math.floor(p.x/256),ty=Math.floor(p.y/256),n=Math.pow(2,z),need={};const radiusX=Math.ceil(w/512)+1,radiusY=Math.ceil(h/512)+1;for(let dx=-radiusX;dx<=radiusX;dx++)for(let dy=-radiusY;dy<=radiusY;dy++){const ix=tx+dx,iy=ty+dy;if(iy<0||iy>=n)continue;const k=z+'-'+ix+'-'+iy;need[k]=true;let im=cache[k];if(!im){im=document.createElement('img');im.className='tile';im.alt='';im.decoding='async';im.loading='eager';im.src='https://tile.openstreetmap.org/'+z+'/'+((ix%n+n)%n)+'/'+iy+'.png';tiles.appendChild(im);cache[k]=im;}im.style.left=(ix*256-p.x+w/2)+'px';im.style.top=(iy*256-p.y+h/2)+'px';}for(const [key,im] of Object.entries(cache)){if(!need[key]){im.remove();delete cache[key];}}svg.setAttribute('viewBox','0 0 '+w+' '+h);let pts=trail.map(q=>(q.x-p.x+w/2).toFixed(1)+','+(q.y-p.y+h/2).toFixed(1)).join(' ');svg.innerHTML='<polyline fill="none" stroke="#168afa" stroke-width="4" opacity="0.8" points="'+pts+'"/>';const markers=document.getElementById("cams");markers.innerHTML="";for(const cam of cameras){let q=project(cam[0],cam[1]),mx=q.x-p.x+w/2,my=q.y-p.y+h/2;if(mx<0||my<0||mx>w||my>h)continue;let d=document.createElement("div");d.className="cam";d.style.left=mx+"px";d.style.top=my+"px";markers.appendChild(d);}}
+          function setCameras(items){cameras=Array.isArray(items)?items.slice(0,25):[];render();}
+          function setZoom(delta){z=Math.min(18,Math.max(13,z+delta));trail=[];for(const im of Object.values(cache))im.remove();cache={};render();}window.addEventListener('resize',render);
+          </script></body></html>
+          TW_DASH_EOF_3
+          cat > app/src/debug/AndroidManifest.xml <<'TW_DASH_MANIFEST_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+              <queries><package android:name="com.google.android.apps.maps" /></queries>
+              <!-- This preview disables the original network/navigation/car control services. -->
+              <application android:name="android.app.Application" tools:replace="android:name,android:label" android:label="NaviPilot Taiwan 3.7.1" tools:targetApi="31">
+                  <activity android:name="com.jixiexiaoge.drivingassist.MainActivity" android:enabled="false" tools:replace="android:enabled" />
+                  <service android:name="com.jixiexiaoge.drivingassist.CarrotAmapForegroundService" android:enabled="false" tools:replace="android:enabled" />
+                  <receiver android:name="com.jixiexiaoge.drivingassist.AmapAutoStaticReceiver" android:enabled="false" tools:replace="android:enabled" />
+                  <service android:name="com.navipilot.amap2tesla.projection.ProjectionService" android:enabled="false" tools:replace="android:enabled" />
+                  <service android:name="com.navipilot.amap2tesla.network.TeslaVirtualIpService" android:enabled="false" tools:replace="android:enabled" />
+                  <activity
+                      android:name="com.jixiexiaoge.drivingassist.TaiwanDashActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden"
+                      android:screenOrientation="unspecified"
+                      android:label="NaviPilot Taiwan">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name="com.jixiexiaoge.drivingassist.TaiwanDashListener"
+                      android:label="NaviPilot Taiwan Google Maps 通知"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+                      android:exported="true">
+                      <intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          TW_DASH_MANIFEST_EOF
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          p = Path('app/build.gradle.kts')
+          s = p.read_text(encoding='utf-8')
+          a = 'applicationIdSuffix = ".debug"'
+          assert s.count(a) == 1, 'Debug application ID suffix changed in upstream; stopping safely'
+          p.write_text(s.replace(a, 'applicationIdSuffix = ".taiwandashboard371"', 1), encoding='utf-8')
+          PYTHON
+
+      - name: Compile isolated Android preview APK
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload installable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NaviPilot-Taiwan-Dashboard-v371-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
