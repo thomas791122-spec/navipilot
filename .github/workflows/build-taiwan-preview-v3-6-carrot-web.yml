@@ -1,0 +1,1295 @@
+name: Build NaviPilot Taiwan Preview v3.6 (Carrot Web embedded + TPMS preview)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout existing NaviPilot source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install Android SDK, NDK and CMake
+        shell: bash
+        run: |
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;26.1.10909125' 'cmake;3.22.1'
+          yes | sdkmanager --licenses > /dev/null || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Inject Taiwan read-only preview (not committed)
+        shell: bash
+        run: |
+          mkdir -p "app/src/main/java/com/jixiexiaoge/drivingassist"
+          cat > 'app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanCameraCatalog.kt' <<'TW_PREVIEW_EOF_0'
+          package com.jixiexiaoge.drivingassist
+          
+          import kotlin.math.*
+          
+          /** Official open-data fixed-camera points. Read-only proximity preview; never controls the vehicle. */
+          internal object TaiwanCameraCatalog {
+              data class Camera(
+                  val latitude: Double,
+                  val longitude: Double,
+                  val address: String,
+                  val direction: String,
+                  val speedLimit: String,
+              )
+              data class Nearby(val camera: Camera, val meters: Int)
+          
+              /** Handles RFC4180-style double quotes, quoted commas, newlines and UTF-8 BOM. */
+              fun parseCsv(csv: String): List<Camera> {
+                  val rows = parseRows(csv)
+                  if (rows.isEmpty()) return emptyList()
+                  fun normalize(s: String) = s.trim().removePrefix("\uFEFF")
+                      .lowercase().replace(" ", "").replace("_", "").replace("-", "")
+                  val columns = rows.first().map(::normalize)
+                  fun col(vararg names: String) = columns.indexOfFirst { it in names.map(::normalize) }
+                  val lat = col("latitude", "緯度", "座標緯度")
+                  val lon = col("longitude", "經度", "座標經度")
+                  val addr = col("address", "設置地址", "設置地點", "設置位置")
+                  val direction = col("direct", "拍攝方向", "拍攝行向")
+                  val limit = col("limit", "速限", "速限-速度限制")
+                  if (lat < 0 || lon < 0) return emptyList()
+                  return rows.drop(1).mapNotNull { row ->
+                      val y = row.getOrNull(lat)?.trim()?.toDoubleOrNull() ?: return@mapNotNull null
+                      val x = row.getOrNull(lon)?.trim()?.toDoubleOrNull() ?: return@mapNotNull null
+                      if (y !in 20.0..27.0 || x !in 117.0..124.0) return@mapNotNull null
+                      Camera(
+                          latitude = y,
+                          longitude = x,
+                          address = row.getOrNull(addr)?.trim().orEmpty(),
+                          direction = row.getOrNull(direction)?.trim().orEmpty(),
+                          speedLimit = row.getOrNull(limit)?.trim().orEmpty(),
+                      )
+                  }.distinctBy { Triple(it.latitude, it.longitude, it.address) }
+              }
+          
+              fun nearest(points: List<Camera>, lat: Double, lon: Double, radiusMeters: Int = 2000): List<Nearby> =
+                  points.map { Nearby(it, distanceMeters(lat, lon, it.latitude, it.longitude).roundToInt()) }
+                      .filter { it.meters <= radiusMeters }
+                      .sortedBy { it.meters }
+                      .take(3)
+          
+              private fun parseRows(content: String): List<List<String>> {
+                  val result = mutableListOf<List<String>>()
+                  val row = mutableListOf<String>()
+                  val cell = StringBuilder()
+                  var quoted = false
+                  var i = 0
+                  while (i < content.length) {
+                      when (val c = content[i]) {
+                          '"' -> if (quoted && i + 1 < content.length && content[i + 1] == '"') {
+                              cell.append('"'); i++
+                          } else quoted = !quoted
+                          ',' -> if (quoted) cell.append(c) else { row.add(cell.toString()); cell.setLength(0) }
+                          '\n' -> if (quoted) cell.append(c) else {
+                              row.add(cell.toString().trimEnd('\r')); cell.setLength(0)
+                              if (row.any { it.isNotEmpty() }) result.add(row.toList())
+                              row.clear()
+                          }
+                          else -> cell.append(c)
+                      }
+                      i++
+                  }
+                  row.add(cell.toString().trimEnd('\r'))
+                  if (row.any { it.isNotEmpty() }) result.add(row.toList())
+                  return result
+              }
+          
+              private fun distanceMeters(aLat: Double, aLon: Double, bLat: Double, bLon: Double): Double {
+                  val latDelta = Math.toRadians(bLat - aLat)
+                  val lonDelta = Math.toRadians(bLon - aLon)
+                  val h = sin(latDelta / 2).pow(2) + cos(Math.toRadians(aLat)) *
+                      cos(Math.toRadians(bLat)) * sin(lonDelta / 2).pow(2)
+                  return 6_371_000.0 * 2 * asin(sqrt(h.coerceIn(0.0, 1.0)))
+              }
+          }
+          
+          internal object TaiwanGoogleNavHint {
+              /** Google Maps notification wording varies by version/language; result is for diagnosis only. */
+              fun summarize(raw: String): String {
+                  val event = when {
+                      listOf("右轉", "turn right").any { raw.contains(it, true) } -> "可能右轉"
+                      listOf("左轉", "turn left").any { raw.contains(it, true) } -> "可能左轉"
+                      listOf("出口", "exit").any { raw.contains(it, true) } -> "可能出口"
+                      listOf("迴轉", "u-turn").any { raw.contains(it, true) } -> "可能迴轉"
+                      else -> "無法可靠判斷方向"
+                  }
+                  val dist = Regex("(\\d+(?:\\.\\d+)?)\\s*(公里|km|公尺|米|m)", RegexOption.IGNORE_CASE).find(raw)
+                  val distance = dist?.value ?: "未取得距離"
+                  return "$event · $distance（僅供觀察，不是控制指令）"
+              }
+          }
+          TW_PREVIEW_EOF_0
+          mkdir -p "app/src/main/java/com/jixiexiaoge/drivingassist"
+          cat > 'app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanNavLogger.kt' <<'TW_PREVIEW_LOG_EOF'
+          package com.jixiexiaoge.drivingassist
+          
+          import android.content.Context
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          
+          /** Debug-only rolling, local history of Google Maps notifications. No commands to comma. */
+          internal object TaiwanNavLogger {
+              private const val PREFS = "taiwan_preview_debug_history"
+              private const val KEY = "events"
+              private const val MAX_CHARS = 12_000
+              private var lastGoogleContent = ""
+              private var lastGoogleAtMs = 0L
+          
+              @Synchronized
+              fun append(context: Context, category: String, message: String) {
+                  val nowMs = System.currentTimeMillis()
+                  // Google Maps can republish the same notification repeatedly.
+                  // Keep changed navigation events, but sample at most once per second.
+                  if (category == "GOOGLE_POST") {
+                      if (message == lastGoogleContent && nowMs - lastGoogleAtMs in 0..10_000) return
+                      if (nowMs - lastGoogleAtMs in 0..2_000) return
+                      lastGoogleContent = message
+                      lastGoogleAtMs = nowMs
+                  }
+                  val whenLocal = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.TAIWAN).format(Date())
+                  val safe = message.replace('\n', ' ').replace('\r', ' ').take(1000)
+                  val entry = "$whenLocal [$category] $safe\n"
+                  val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                  val old = prefs.getString(KEY, "").orEmpty()
+                  val combined = (old + entry).takeLast(MAX_CHARS)
+                  prefs.edit().putString(KEY, combined).apply()
+              }
+          
+              @Synchronized
+              fun dump(context: Context): String {
+                  val content = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .getString(KEY, "").orEmpty()
+                  val crash = lastCrash(context).ifBlank { "（未記錄到 Java/Kotlin 閃退；系統強制終止或記憶體不足可能無法記錄）" }
+                  return "NaviPilot Taiwan Preview v3.6 — 背景／停止／轉向診斷\n" +
+                      "僅觀察，無車輛控制。分享前請檢查路名及目的地等隱私。\n" +
+                      "上次程式閃退：\n$crash\n\n" +
+                      "通知歷史（最多 $MAX_CHARS 字元）：\n" +
+                      content.ifBlank { "目前沒有紀錄。" }
+              }
+          
+              @Synchronized
+              fun countChars(context: Context): Int =
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .getString(KEY, "").orEmpty().length
+
+              @Synchronized
+              fun lastCrash(context: Context): String =
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .getString("last_crash", "").orEmpty()
+
+              @Synchronized
+              fun clear(context: Context) {
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                      .remove(KEY).remove("last_crash").apply()
+              }
+          }
+          TW_PREVIEW_LOG_EOF
+          mkdir -p "app/src/main/java/com/jixiexiaoge/drivingassist"
+          cat > 'app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanPreviewApplication.kt' <<'TW_APP_DIAGNOSTIC_EOF'
+          package com.jixiexiaoge.drivingassist
+
+          import android.app.Application
+
+          /** Best-effort local crash summary. The original crash handler still runs. */
+          class TaiwanPreviewApplication : Application() {
+              override fun onCreate() {
+                  super.onCreate()
+                  val previous = Thread.getDefaultUncaughtExceptionHandler()
+                  Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+                      try {
+                          val trace = error.stackTrace.take(8).joinToString(" | ")
+                          val detail = "${error.javaClass.simpleName}: ${error.message.orEmpty().take(240)} | $trace"
+                          getSharedPreferences("taiwan_preview_debug_history", MODE_PRIVATE)
+                              .edit().putString("last_crash", detail.take(1300)).commit()
+                      } catch (_: Throwable) { /* Low-memory crashes may not be recordable. */ }
+                      if (previous != null) previous.uncaughtException(thread, error)
+                      else android.os.Process.killProcess(android.os.Process.myPid())
+                  }
+              }
+          }
+          TW_APP_DIAGNOSTIC_EOF
+          mkdir -p "app/src/main/java/com/jixiexiaoge/drivingassist"
+          mkdir -p "app/src/main/java/com/jixiexiaoge/drivingassist"
+          cat > 'app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanPreviewSession.kt' <<'TW_PREVIEW_SESSION_EOF'
+          package com.jixiexiaoge.drivingassist
+
+          import android.content.Context
+
+          /** Explicit opt-in observation session. No remote Carrot commands. */
+          internal object TaiwanPreviewSession {
+              private const val PREFS = "tw_preview_v35_session"
+              private const val NO_PROGRESS_TIMEOUT_MS = 20 * 60 * 1000L
+
+              fun isRecording(context: Context): Boolean =
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .getBoolean("recording", false)
+
+              @Synchronized
+              fun start(context: Context) {
+                  val now = System.currentTimeMillis()
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                      .putBoolean("recording", true)
+                      .putLong("started_ms", now)
+                      .putLong("last_progress_ms", now)
+                      .putLong("last_notification_ms", 0L)
+                      .remove("road")
+                      .remove("distance_m")
+                      .putString("reason", "user_started")
+                      .apply()
+                  TaiwanNavLogger.append(context, "SESSION", "started; background_notification_only")
+              }
+
+              @Synchronized
+              fun stop(context: Context, reason: String) {
+                  if (!isRecording(context)) return
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                      .putBoolean("recording", false)
+                      .putString("reason", reason.take(60))
+                      .apply()
+                  context.getSharedPreferences(TaiwanMapsListener.PREFS, Context.MODE_PRIVATE)
+                      .edit().putBoolean("active", false).apply()
+                  TaiwanNavLogger.append(context, "SESSION", "stopped reason=$reason")
+              }
+
+              fun status(context: Context): String {
+                  val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                  val since = p.getLong("last_notification_ms", 0L)
+                  val last = if (since == 0L) "尚未收到導航通知" else
+                      "最後通知 ${((System.currentTimeMillis() - since).coerceAtLeast(0L) / 1000L)} 秒前"
+                  return if (p.getBoolean("recording", false)) "記錄中（可背景接收） · $last" else
+                      "已停止／待機（${p.getString("reason", "尚未開始")}）"
+              }
+
+              fun parseDistanceMeters(raw: String): Int? {
+                  val hit = Regex("""^\s*(\d+(?:\.\d+)?)\s*(公尺|公里|km|m)""", RegexOption.IGNORE_CASE)
+                      .find(raw) ?: return null
+                  val num = hit.groupValues[1].toDoubleOrNull() ?: return null
+                  val unit = hit.groupValues[2].lowercase()
+                  val meters = if (unit == "公里" || unit == "km") num * 1000 else num
+                  return meters.takeIf { it.isFinite() && it in 0.0..2000000.0 }?.toInt()
+              }
+
+              @Synchronized
+              fun acceptNavigation(context: Context, fields: List<Pair<String, String>>): Boolean {
+                  val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                  if (!prefs.getBoolean("recording", false)) return false
+                  val now = System.currentTimeMillis()
+                  val progress = prefs.getLong("last_progress_ms", now)
+                  if (now - progress > NO_PROGRESS_TIMEOUT_MS) {
+                      stop(context, "no_navigation_progress_20min")
+                      return false
+                  }
+                  val title = fields.firstOrNull { it.first == "title" }?.second.orEmpty()
+                  val road = fields.firstOrNull { it.first == "text" }?.second.orEmpty().take(150)
+                  val distance = parseDistanceMeters(title)
+                  val oldRoad = prefs.getString("road", "").orEmpty()
+                  val oldDistance = prefs.getInt("distance_m", -1)
+                  val changed = (road.isNotBlank() && road != oldRoad) ||
+                      (distance != null && distance != oldDistance)
+                  val lastWritten = prefs.getLong("last_notification_ms", 0L)
+                  if (changed || now - lastWritten > 5_000L) {
+                      prefs.edit().apply {
+                          putLong("last_notification_ms", now)
+                          if (changed) {
+                              putLong("last_progress_ms", now)
+                              if (road.isNotBlank()) putString("road", road)
+                              if (distance != null) putInt("distance_m", distance)
+                          }
+                      }.apply()
+                  }
+                  return true
+              }
+
+              @Synchronized
+              fun pauseIfIdle(context: Context) {
+                  if (!isRecording(context)) return
+                  val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                  val progress = p.getLong("last_progress_ms", System.currentTimeMillis())
+                  if (System.currentTimeMillis() - progress > NO_PROGRESS_TIMEOUT_MS)
+                      stop(context, "no_navigation_progress_20min")
+              }
+          }
+          TW_PREVIEW_SESSION_EOF
+          cat > 'app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanMapsListener.kt' <<'TW_PREVIEW_EOF_1'
+          package com.jixiexiaoge.drivingassist
+          
+          import android.app.Notification
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.drawable.Icon
+          import java.io.File
+          import java.io.FileOutputStream
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          
+          /** Read-only Google Maps notification observer. NEVER sends driving/control commands. */
+          class TaiwanMapsListener : NotificationListenerService() {
+              private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+              private var pendingStop: Runnable? = null
+              private var lastAcceptedNotificationId: Int? = null
+              private var lastIconSampleMs = 0L
+              private var lastIconHash: Int? = null
+              private var lastErrorMs = 0L
+              private var skippedErrors = 0
+
+              /** Report the first actual exception site, not hundreds of identical messages. */
+              private fun logNotifyError(stage: String, e: RuntimeException) {
+                  val now = android.os.SystemClock.elapsedRealtime()
+                  if (lastErrorMs != 0L && now - lastErrorMs < 30_000L) {
+                      skippedErrors++
+                      return
+                  }
+                  val site = e.stackTrace.firstOrNull()?.let {
+                      "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}"
+                  }.orEmpty()
+                  val detail = "stage=$stage kind=${e.javaClass.simpleName} " +
+                      "message=${e.message.orEmpty().replace('\n', ' ').take(160)} " +
+                      "at=$site skipped=$skippedErrors"
+                  lastErrorMs = now
+                  skippedErrors = 0
+                  TaiwanNavLogger.append(this, "NOTIFY_ERROR", detail)
+              }
+
+              /** Draw only the Google navigation notification's small icon into a fixed 96x96 preview.
+               *  No screenshots, route image capture, or vehicle control.
+               */
+              private fun sampleTurnIcon(notification: Notification) {
+                  val now = android.os.SystemClock.elapsedRealtime()
+                  if (now - lastIconSampleMs in 0..4000L) return
+                  lastIconSampleMs = now
+                  val icon = notification.smallIcon ?: return
+                  try {
+                      // TYPE_BITMAP=1 in Android. Do not call getResId() on this type.
+                      val drawable = icon.loadDrawable(this) ?: return
+                      val bitmap = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888)
+                      try {
+                          drawable.setBounds(0, 0, 96, 96)
+                          drawable.draw(Canvas(bitmap))
+                          var fingerprint = 1
+                          for (y in 0 until 96 step 8) {
+                              for (x in 0 until 96 step 8) fingerprint = 31 * fingerprint + bitmap.getPixel(x, y)
+                          }
+                          if (fingerprint != lastIconHash) {
+                              FileOutputStream(File(filesDir, "taiwan_nav_turn_icon.png")).use {
+                                  bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
+                              }
+                              lastIconHash = fingerprint
+                              getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                                  .putLong("last_icon_time", System.currentTimeMillis())
+                                  .putString("last_icon_hash", Integer.toHexString(fingerprint))
+                                  .apply()
+                              TaiwanNavLogger.append(this, "ICON_SAMPLE", "type=${icon.type} hash=${Integer.toHexString(fingerprint)}")
+                          }
+                      } finally { bitmap.recycle() }
+                  } catch (e: RuntimeException) {
+                      logNotifyError("icon_preview", e)
+                  }
+              }
+
+              override fun onListenerConnected() {
+                  super.onListenerConnected()
+                  TaiwanNavLogger.append(this, "SYSTEM", "notification_listener_connected")
+              }
+
+              override fun onNotificationPosted(sbn: StatusBarNotification?) {
+                  if (sbn?.packageName != GOOGLE_MAPS_PACKAGE) return
+                  if (!TaiwanPreviewSession.isRecording(this)) return
+                  pendingStop?.let { mainHandler.removeCallbacks(it) }
+                  pendingStop = null
+                  try {
+                      val notification = sbn.notification
+                      val extras = notification.extras ?: return
+                      val requestedFields = listOf(
+                          "title" to Notification.EXTRA_TITLE,
+                          "text" to Notification.EXTRA_TEXT,
+                          "big_text" to Notification.EXTRA_BIG_TEXT,
+                          "sub_text" to Notification.EXTRA_SUB_TEXT,
+                          "summary_text" to Notification.EXTRA_SUMMARY_TEXT,
+                          "info_text" to Notification.EXTRA_INFO_TEXT,
+                      )
+                      val fields = requestedFields.mapNotNull { (label, key) ->
+                          try {
+                              extras.getCharSequence(key)?.toString()?.take(500)
+                                  ?.takeIf { it.isNotBlank() }?.let { label to it }
+                          } catch (e: RuntimeException) {
+                              logNotifyError("text:$label", e)
+                              null
+                          }
+                      }
+                      val lines = try {
+                          extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
+                              ?.take(4)?.joinToString(" / ") { it.toString().take(120) }
+                              .orEmpty()
+                      } catch (e: RuntimeException) {
+                          logNotifyError("text_lines", e)
+                          ""
+                      }
+                      val iconInfo = try {
+                          val icon = notification.smallIcon
+                          when {
+                              icon == null -> "none"
+                              icon.type == android.graphics.drawable.Icon.TYPE_RESOURCE -> "resource:${icon.resId}"
+                              else -> "type:${icon.type}" // getResId() throws unless TYPE_RESOURCE
+                          }
+                      } catch (e: RuntimeException) {
+                          logNotifyError("small_icon", e)
+                          "unavailable"
+                      }
+                      if (!TaiwanPreviewSession.acceptNavigation(this, fields)) return
+                      lastAcceptedNotificationId = sbn.id
+                      // Fixed-size icon preview; no image or vehicle data is transmitted.
+                      sampleTurnIcon(notification)
+                      // Do NOT enumerate arbitrary Parcel-backed extras / actions for every update.
+                      val meta = "id=${sbn.id} icon=$iconInfo"
+                      TaiwanNavLogger.append(
+                          this, "GOOGLE_POST",
+                          "${fields.joinToString(" | ") { "${it.first}=${it.second}" }} | lines=$lines | $meta"
+                      )
+                      val parts = fields.filter { it.first in listOf("title", "text", "big_text", "sub_text") }
+                          .map { it.second }.distinct()
+                      if (parts.isEmpty()) return
+                      getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                          .putString("last_text", parts.joinToString(" | ").take(1500))
+                          .putLong("last_time", System.currentTimeMillis())
+                          .putBoolean("active", true)
+                          .apply()
+                  } catch (e: RuntimeException) {
+                      logNotifyError("onNotificationPosted", e)
+                  }
+              }
+
+              override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+                  if (sbn?.packageName != GOOGLE_MAPS_PACKAGE) return
+                  if (!TaiwanPreviewSession.isRecording(this)) return
+                  if (lastAcceptedNotificationId != sbn.id) return
+                  try {
+                      TaiwanNavLogger.append(this, "GOOGLE_REMOVE", "id=${sbn.id}; grace_period=90sec")
+                      getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                          .putBoolean("active", false).apply()
+                      pendingStop?.let { mainHandler.removeCallbacks(it) }
+                      val task = Runnable {
+                          // Another Google Maps navigation update cancels this runnable.
+                          TaiwanPreviewSession.stop(this, "navigation_notification_removed_90sec")
+                      }
+                      pendingStop = task
+                      mainHandler.postDelayed(task, 90_000L)
+                  } catch (e: RuntimeException) {
+                      logNotifyError("onNotificationRemoved", e)
+                  }
+              }
+
+              override fun onDestroy() {
+                  pendingStop?.let { mainHandler.removeCallbacks(it) }
+                  pendingStop = null
+                  super.onDestroy()
+              }
+
+              companion object {
+                  const val PREFS = "taiwan_navigation_preview"
+                  const val GOOGLE_MAPS_PACKAGE = "com.google.android.apps.maps"
+              }
+          }
+          TW_PREVIEW_EOF_1
+          mkdir -p "app/src/main/java/com/jixiexiaoge/drivingassist"
+          cat > 'app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanPreviewActivity.kt' <<'TW_PREVIEW_EOF_2'
+          package com.jixiexiaoge.drivingassist
+          
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.location.Location
+          import android.location.LocationListener
+          import android.location.LocationManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ImageView
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.io.File
+          import java.net.URL
+          import kotlin.concurrent.thread
+          
+          /** Separate TEST launcher. It never calls NaviStreamManager, 7706, 7714, or any control API. */
+          class TaiwanPreviewActivity : Activity() {
+              private lateinit var report: TextView
+              private lateinit var sessionStatus: TextView
+              private lateinit var liveSummary: TextView
+              private lateinit var logView: TextView
+              private lateinit var iconPreview: ImageView
+              private var lastIconFileModifiedMs = 0L
+              private lateinit var locationManager: LocationManager
+              private val uiHandler = Handler(Looper.getMainLooper())
+              private var lastLocation: Location? = null
+              private var locationListening = false
+              private var locationPermissionRequested = false
+              private var firstGpsFixLogged = false
+              private var lastGpsUiAtMs = 0L
+              private var cameras: List<TaiwanCameraCatalog.Camera> = emptyList()
+              private var loading = false
+              private val locationListener = object : LocationListener {
+                  override fun onLocationChanged(location: Location) {
+                      lastLocation = location
+                      if (!firstGpsFixLogged) {
+                          firstGpsFixLogged = true
+                          val acc = if (location.hasAccuracy()) "${location.accuracy.toInt()}m" else "unknown"
+                          // Do not persist GPS coordinates in the shared diagnostic log.
+                          TaiwanNavLogger.append(this@TaiwanPreviewActivity, "GPS", "first_fix accuracy=$acc provider=${location.provider}")
+                      }
+                      val now = android.os.SystemClock.uptimeMillis()
+                      if (now - lastGpsUiAtMs >= 2000L) {
+                          lastGpsUiAtMs = now
+                          showReport()
+                      }
+                  }
+              }
+              private val refreshTask = object : Runnable {
+                  override fun run() {
+                      showReport()
+                      uiHandler.postDelayed(this, if (TaiwanPreviewSession.isRecording(this@TaiwanPreviewActivity)) 2500 else 30000)
+                  }
+              }
+          
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(32, 28, 32, 28)
+                  }
+                  val title = TextView(this).apply {
+                      text = "NaviPilot 台灣導航 v3.6（唯讀）"
+                      textSize = 22f
+                  }
+                  root.addView(title)
+                  sessionStatus = TextView(this).apply { textSize = 18f; setPadding(0, 10, 0, 15) }
+                  root.addView(sessionStatus)
+                  fun button(label: String, onClick: () -> Unit) {
+                      root.addView(Button(this).apply { text = label; setOnClickListener { onClick() } })
+                  }
+                  button("▶ 開始測試（背景接收通知）") {
+                      TaiwanPreviewSession.start(this)
+                      requestLocation()
+                      showReport()
+                  }
+                  button("■ 停止本程式測試（不會停止 Google 地圖）") {
+                      TaiwanPreviewSession.stop(this, "user_stopped")
+                      if (locationListening) {
+                          runCatching { locationManager.removeUpdates(locationListener) }
+                          locationListening = false
+                      }
+                      showReport()
+                  }
+                  button("1. 開啟 Google Maps 通知存取權") {
+                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                  }
+                  button("2. 開啟 Google Maps 全螢幕（本程式在背景）") {
+                      val intent = packageManager.getLaunchIntentForPackage(TaiwanMapsListener.GOOGLE_MAPS_PACKAGE)
+                          ?: Intent(Intent.ACTION_VIEW, Uri.parse("https://maps.google.com"))
+                      startActivity(intent)
+                  }
+
+                  button("C4 Carrot Web／即時影像／胎壓（測試）") {
+                      startActivity(Intent(this, TaiwanCarrotWebActivity::class.java))
+                  }
+                  button("3. 檢查 GPS 定位／權限") { requestLocation() }
+                  button("4. 下載警政署固定測速點 CSV") { downloadOfficialCsv() }
+                  button("5. 若下載失敗，選取 CSV 檔案") {
+                      val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                          addCategory(Intent.CATEGORY_OPENABLE)
+                          type = "*/*"
+                          putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("text/csv", "text/plain", "application/vnd.ms-excel"))
+                      }
+                      startActivityForResult(intent, IMPORT_CSV)
+                  }
+                  button("重新整理資料") { showReport() }
+                  button("查看 Google Maps 歷史 Log") {
+                      logView.text = TaiwanNavLogger.dump(this).takeLast(6_000)
+                  }
+                  button("分享診斷 Log（文字）") {
+                      val message = TaiwanNavLogger.dump(this)
+                      val share = Intent(Intent.ACTION_SEND).apply {
+                          type = "text/plain"
+                          putExtra(Intent.EXTRA_SUBJECT, "NaviPilot 台灣導航測試 v3.6 Log")
+                          putExtra(Intent.EXTRA_TEXT, message)
+                      }
+                      startActivity(Intent.createChooser(share, "分享 Google Maps 診斷紀錄"))
+                  }
+                  button("清除歷史 Log") {
+                      TaiwanNavLogger.clear(this)
+                      logView.text = "歷史 Log 已清除。"
+                  }
+                  liveSummary = TextView(this).apply {
+                      textSize = 21f
+                      setPadding(0, 18, 0, 14)
+                  }
+                  root.addView(liveSummary)
+                  root.addView(TextView(this).apply {
+                      text = "Google Maps 導航通知圖示（確認是否為轉彎箭頭）"
+                      textSize = 16f
+                      setPadding(0, 20, 0, 10)
+                  })
+                  val previewPx = (180 * resources.displayMetrics.density).toInt()
+                  iconPreview = ImageView(this).apply {
+                      setBackgroundColor(Color.rgb(42, 53, 65))
+                      setPadding(12, 12, 12, 12)
+                      scaleType = ImageView.ScaleType.FIT_CENTER
+                      layoutParams = LinearLayout.LayoutParams(previewPx, previewPx)
+                  }
+                  root.addView(iconPreview)
+                  report = TextView(this).apply { textSize = 16f; setPadding(0, 20, 0, 20) }
+                  root.addView(report)
+                  logView = TextView(this).apply { textSize = 13f; setPadding(0, 20, 0, 20) }
+                  root.addView(logView)
+                  setContentView(ScrollView(this).apply { addView(root) })
+                  val file = File(filesDir, FILE_NAME)
+                  if (file.exists()) loadCsv(file.readText(), from = "手機先前下載的資料")
+                  showReport()
+                  // Explicit Start enables the listener and asks for GPS permission.
+                  // No GPS request occurs when the test is stopped.
+              }
+          
+              override fun onResume() {
+                  super.onResume()
+                  uiHandler.post(refreshTask)
+                  // The background notification listener may continue, but GPS is foreground-only.
+                  TaiwanPreviewSession.pauseIfIdle(this)
+                  if (TaiwanPreviewSession.isRecording(this) && hasAnyLocationPermission()) requestLocation()
+              }
+          
+              override fun onPause() {
+                  uiHandler.removeCallbacks(refreshTask)
+                  if (locationListening) {
+                      runCatching { locationManager.removeUpdates(locationListener) }
+                      locationListening = false
+                  }
+                  // Do not continue background location tracking in this diagnostic build.
+                  super.onPause()
+              }
+          
+              override fun onDestroy() {
+                  runCatching { locationManager.removeUpdates(locationListener) }
+                  super.onDestroy()
+              }
+          
+              private fun hasAnyLocationPermission(): Boolean =
+                  checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                  checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+          
+              private fun requestLocation() {
+                  if (!TaiwanPreviewSession.isRecording(this)) {
+                      showReport()
+                      return
+                  }
+                  val fineGranted = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                  val coarseGranted = checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                  if (!fineGranted && !coarseGranted) {
+                      if (!locationPermissionRequested) {
+                          locationPermissionRequested = true
+                          TaiwanNavLogger.append(this, "GPS", "requesting_foreground_location_permission")
+                          // Android 12+ requires FINE and COARSE to be requested together.
+                          requestPermissions(arrayOf(
+                              Manifest.permission.ACCESS_FINE_LOCATION,
+                              Manifest.permission.ACCESS_COARSE_LOCATION,
+                          ), GPS_PERMISSION)
+                      } else {
+                          Toast.makeText(this, "請到 Android 設定允許定位權限", Toast.LENGTH_LONG).show()
+                      }
+                      showReport()
+                      return
+                  }
+                  if (locationListening) return
+                  try {
+                      val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+                          .filter { it != LocationManager.GPS_PROVIDER || fineGranted }
+                          .filter { locationManager.isProviderEnabled(it) }
+                      if (providers.isEmpty()) {
+                          TaiwanNavLogger.append(this, "GPS", "no_available_location_provider")
+                          Toast.makeText(this, "請開啟手機系統定位功能", Toast.LENGTH_LONG).show()
+                          showReport()
+                          return
+                      }
+                      providers.forEach { provider ->
+                          locationManager.requestLocationUpdates(provider, 2000L, 5f, locationListener)
+                          locationManager.getLastKnownLocation(provider)?.let { candidate ->
+                              if (lastLocation == null || candidate.time > lastLocation!!.time) lastLocation = candidate
+                          }
+                      }
+                      locationListening = true
+                      TaiwanNavLogger.append(this, "GPS", "started provider=${providers.joinToString("+")} fine=$fineGranted coarse=$coarseGranted")
+                      showReport()
+                  } catch (e: SecurityException) {
+                      TaiwanNavLogger.append(this, "GPS", "security_exception")
+                      Toast.makeText(this, "定位權限不足", Toast.LENGTH_SHORT).show()
+                  } catch (e: IllegalArgumentException) {
+                      TaiwanNavLogger.append(this, "GPS", "location_provider_unavailable")
+                      Toast.makeText(this, "定位提供者不可用", Toast.LENGTH_SHORT).show()
+                  }
+              }
+          
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode == GPS_PERMISSION) {
+                      val granted = hasAnyLocationPermission()
+                      TaiwanNavLogger.append(this, "GPS", "permission_result granted=$granted precise=${checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED}")
+                      if (granted) requestLocation() else showReport()
+                  }
+              }
+          
+              @Deprecated("Compatibility with Android document picker")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != IMPORT_CSV || resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+                  try {
+                      val content = contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                      if (content != null) loadCsv(content, "使用者匯入的 CSV")
+                  } catch (e: Exception) { report.text = "讀取 CSV 失敗：${e.javaClass.simpleName}" }
+              }
+          
+              private fun downloadOfficialCsv() {
+                  if (loading) return
+                  loading = true
+                  showReport()
+                  thread(name = "TaiwanCameraCsvDownload") {
+                      val result = runCatching {
+                          val conn = URL(OFFICIAL_CSV).openConnection().apply {
+                              connectTimeout = 15000
+                              readTimeout = 20000
+                          }
+                          val data = conn.getInputStream().use { stream ->
+                              stream.bufferedReader(Charsets.UTF_8).readText()
+                          }
+                          if (data.length > 6_000_000) throw IllegalStateException("CSV 檔案過大")
+                          data
+                      }
+                      runOnUiThread {
+                          loading = false
+                          result.onSuccess { loadCsv(it, "警政署公開 CSV") }
+                              .onFailure { report.text = "下載失敗（${it.javaClass.simpleName}）。可從 data.gov.tw/dataset/7320 下載 CSV，再按第 5 項匯入。" }
+                      }
+                  }
+              }
+          
+              private fun loadCsv(csv: String, from: String) {
+                  val parsed = TaiwanCameraCatalog.parseCsv(csv)
+                  if (parsed.isEmpty()) {
+                      report.text = "未能解析固定測速點。需包含 Latitude、Longitude、Address、direct、limit 欄位。"
+                      return
+                  }
+                  cameras = parsed
+                  File(filesDir, FILE_NAME).writeText(csv)
+                  Toast.makeText(this, "$from：載入 ${parsed.size} 筆", Toast.LENGTH_LONG).show()
+                  showReport()
+              }
+          
+              private fun showReport() {
+                  if (!::report.isInitialized) return
+                  TaiwanPreviewSession.pauseIfIdle(this)
+                  if (::sessionStatus.isInitialized) sessionStatus.text =
+                      "狀態：${TaiwanPreviewSession.status(this)}\n" +
+                      "背景模式：只收 Google Maps 通知，背景不讀 GPS。\n" +
+                      "導航停止或 20 分鐘無距離進度時自動待機（受 Android 排程限制）。"
+                  if (::liveSummary.isInitialized) {
+                      val latest = getSharedPreferences(TaiwanMapsListener.PREFS, MODE_PRIVATE)
+                      liveSummary.text = "導航資訊：\n" + latest.getString("last_text", "尚無 Google Maps 通知")
+                  }
+                  val iconFile = File(filesDir, "taiwan_nav_turn_icon.png")
+                  if (::iconPreview.isInitialized && iconFile.isFile &&
+                      iconFile.lastModified() != lastIconFileModifiedMs) {
+                      try {
+                          val bitmap = BitmapFactory.decodeFile(iconFile.absolutePath)
+                          if (bitmap != null) {
+                              iconPreview.setImageBitmap(bitmap)
+                              lastIconFileModifiedMs = iconFile.lastModified()
+                          }
+                      } catch (_: RuntimeException) { /* Let later refresh retry. */ }
+                  }
+                  val prefs = getSharedPreferences(TaiwanMapsListener.PREFS, MODE_PRIVATE)
+                  val raw = prefs.getString("last_text", "").orEmpty()
+                  val stamp = prefs.getLong("last_time", 0)
+                  val elapsed = System.currentTimeMillis() - stamp
+                  val fresh = TaiwanPreviewSession.isRecording(this) && raw.isNotBlank() &&
+                      elapsed in 0..15_000 && prefs.getBoolean("active", false)
+                  val location = lastLocation
+                  val locationPermission = when {
+                      checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED -> "精確定位已授權"
+                      checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED -> "只有約略定位（測速匹配可能不準）"
+                      else -> "未授權（請按第 3 項或到手機設定開啟）"
+                  }
+                  val cameraText = if (location == null) "尚未取得 GPS 位置" else {
+                      val age = System.currentTimeMillis() - location.time
+                      if (age !in 0..30_000 || (location.hasAccuracy() && location.accuracy > 100f)) {
+                          "GPS 過期或精度不足：不顯示測速點"
+                      } else {
+                          val nearby = TaiwanCameraCatalog.nearest(cameras, location.latitude, location.longitude)
+                          if (nearby.isEmpty()) "目前直線 2 公里內未找到資料庫測速點" else nearby.joinToString("\n") {
+                              "約 ${it.meters} m｜速限 ${it.camera.speedLimit.ifBlank { "未知" }}｜${it.camera.address}｜${it.camera.direction}"
+                          }
+                      }
+                  }
+                  val runtime = Runtime.getRuntime()
+                  val heapUsed = ((runtime.totalMemory() - runtime.freeMemory()) / 1_048_576L)
+                  val heapCap = runtime.maxMemory() / 1_048_576L
+                  val crash = TaiwanNavLogger.lastCrash(this).let { if (it.isBlank()) "無／尚未記錄" else it.take(300) }
+                  report.text = """
+                      本工具只觀察資料，不向 comma 4 傳送導航／速度／煞車／變道指令。
+                      背景使用限制：切回 Google 地圖後，通知接收可持續，但 GPS 更新會停止。
+          
+                      Google Maps 通知：${if (fresh) "最近 15 秒有效" else "尚無新鮮資料／通知已移除"}
+                      原始文字：${raw.ifBlank { "（請啟動 Google Maps 導航並授權通知存取）" }}
+                      解析預覽：${TaiwanGoogleNavHint.summarize(raw)}
+                      圖示最後更新：${prefs.getLong("last_icon_time", 0).let { if (it == 0L) "尚未取得" else java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.TAIWAN).format(java.util.Date(it)) }}
+                      圖示指紋：${prefs.getString("last_icon_hash", "未知")}（只供不同轉向圖示比對，不代表方向）
+          
+                      台灣固定測速資料：${cameras.size} 筆 ${if (loading) "（下載中）" else ""}
+                      定位權限：$locationPermission
+                      記憶體觀察：Java heap $heapUsed / $heapCap MB（不等於系統快取）
+                      Log 長度：${TaiwanNavLogger.countChars(this)} / 12000 字元
+                      上次閃退摘要：$crash
+                      GPS：${location?.let { "${it.latitude}, ${it.longitude}" } ?: "未啟用"}
+                      鄰近測速點（僅 GPS 直線距離）：
+                      $cameraText
+          
+                      注意：未驗證行車方向、上下匝道、平面與高架是否同一路線；距離不代表行車距離，也不代表速限正確。這些資料不可直接用於自動減速。
+                      資料來源：內政部警政署「測速執法設置點」（data.gov.tw/dataset/7320）；非神盾官方資料。
+                  """.trimIndent()
+              }
+          
+              companion object {
+                  private const val GPS_PERMISSION = 417
+                  private const val IMPORT_CSV = 418
+                  private const val FILE_NAME = "taiwan_cameras.csv"
+                  private const val OFFICIAL_CSV = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/EA5E6FCD-B82D-43B7-A5CF-E9893253187E/resource/6D874102-9EB0-4C64-A64C-87A1ACE1D573/download"
+              }
+          }
+          TW_PREVIEW_EOF_2
+          mkdir -p "app/src/test/java/com/jixiexiaoge/drivingassist"
+          mkdir -p "app/src/main/java/com/jixiexiaoge/drivingassist"
+          cat > 'app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanCarrotWebUrl.kt' <<'TW_CARROT_URL_EOF'
+          package com.jixiexiaoge.drivingassist
+
+          import java.net.URI
+
+          /** Carrot Web is a same-Wi-Fi local service. Block all non-local destinations. */
+          internal object TaiwanCarrotWebUrl {
+              fun normalize(rawInput: String): String? {
+                  val input = rawInput.trim()
+                  if (input.isBlank()) return null
+                  val candidate = if (input.startsWith("http://", ignoreCase = true)) input
+                      else if (input.contains("://")) return null else "http://$input"
+                  val uri = runCatching { URI(candidate) }.getOrNull() ?: return null
+                  if (uri.scheme != "http" || uri.userInfo != null || uri.fragment != null) return null
+                  val host = uri.host ?: return null
+                  if (!isPrivateHost(host) || uri.port !in listOf(-1, 7000)) return null
+                  return "http://$host:7000/"
+              }
+
+              fun sameDevice(url: String, acceptedBase: String): Boolean {
+                  val request = runCatching { URI(url) }.getOrNull() ?: return false
+                  val base = runCatching { URI(acceptedBase) }.getOrNull() ?: return false
+                  return request.scheme == "http" && request.host?.equals(base.host, ignoreCase = true) == true &&
+                      request.port == 7000 && request.userInfo == null
+              }
+
+              private fun isPrivateHost(host: String): Boolean {
+                  if (host.endsWith(".local", ignoreCase = true) && host.length > 6) return true
+                  val parts = host.split('.')
+                  if (parts.size != 4) return false
+                  val ip = parts.map { it.toIntOrNull() ?: return false }
+                  if (ip.any { it !in 0..255 }) return false
+                  return ip[0] == 10 ||
+                      (ip[0] == 172 && ip[1] in 16..31) ||
+                      (ip[0] == 192 && ip[1] == 168) ||
+                      (ip[0] == 169 && ip[1] == 254)
+              }
+          }
+          TW_CARROT_URL_EOF
+          mkdir -p "app/src/main/java/com/jixiexiaoge/drivingassist"
+          cat > 'app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanCarrotWebActivity.kt' <<'TW_CARROT_WEB_EOF'
+          package com.jixiexiaoge.drivingassist
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.ViewGroup
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceError
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          /** Read-only NaviPilot diagnostic wrapper; Carrot Web itself may contain interactive settings.
+           *  This class sends no Navi / speed / CAN or vehicle-control messages.
+           */
+          class TaiwanCarrotWebActivity : Activity() {
+              private var web: WebView? = null
+              private var activeBase: String? = null
+              private lateinit var urlField: EditText
+              private lateinit var status: TextView
+              private lateinit var navigation: TextView
+              private lateinit var webHolder: LinearLayout
+              private val handler = Handler(Looper.getMainLooper())
+              private val ticker = object : Runnable {
+                  override fun run() {
+                      val before = TaiwanPreviewSession.isRecording(this@TaiwanCarrotWebActivity)
+                      TaiwanPreviewSession.pauseIfIdle(this@TaiwanCarrotWebActivity)
+                      val after = TaiwanPreviewSession.isRecording(this@TaiwanCarrotWebActivity)
+                      if (before && !after) {
+                          releaseWeb("導航逾時已停止，網頁也已關閉")
+                      }
+                      updateNavigation()
+                      handler.postDelayed(this, 2500L)
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val density = resources.displayMetrics.density
+                  val pad = (10 * density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                      setBackgroundColor(Color.WHITE)
+                  }
+                  root.addView(TextView(this).apply {
+                      text = "C4 Carrot Web + Google 導航｜台灣測試 v3.6"
+                      textSize = 18f
+                      setTextColor(Color.BLACK)
+                  })
+                  root.addView(TextView(this).apply {
+                      text = "僅限 C4 同一 Wi-Fi｜Carrot Web 本身可能包含可修改設定的功能，請停車操作"
+                      textSize = 12f
+                      setTextColor(Color.DKGRAY)
+                  })
+                  val inputRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  urlField = EditText(this).apply {
+                      setSingleLine(true)
+                      textSize = 14f
+                      hint = "http://C4-IP:7000"
+                      setText(getSharedPreferences("tw_carrot_web", MODE_PRIVATE)
+                          .getString("url", "http://172.20.10.3:7000"))
+                  }
+                  inputRow.addView(urlField, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  inputRow.addView(Button(this).apply {
+                      text = "連線"
+                      setOnClickListener { connectWeb() }
+                  })
+                  root.addView(inputRow)
+                  val controlRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  fun control(text: String, onClick: () -> Unit) {
+                      controlRow.addView(Button(this).apply {
+                          this.text = text
+                          setOnClickListener { onClick() }
+                      }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  }
+                  control("重新整理") { web?.reload() ?: connectWeb() }
+                  control("關閉影像") { releaseWeb("Carrot Web 已關閉") }
+                  control("停止全部") {
+                      TaiwanPreviewSession.stop(this, "user_stopped_carrot_web")
+                      releaseWeb("已停止通知測試與 Carrot Web")
+                      updateNavigation()
+                  }
+                  root.addView(controlRow)
+                  navigation = TextView(this).apply {
+                      textSize = 15f
+                      setTextColor(Color.BLACK)
+                      setPadding(0, pad / 2, 0, pad / 2)
+                  }
+                  root.addView(navigation)
+                  status = TextView(this).apply {
+                      text = "按「連線」顯示 C4 Carrot Web；若 C4 網址已變更請修改。"
+                      textSize = 12f
+                      setTextColor(Color.DKGRAY)
+                  }
+                  root.addView(status)
+                  webHolder = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  root.addView(webHolder, LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                  val bottom = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  bottom.addView(Button(this).apply {
+                      text = "▶ 啟動導航記錄"
+                      setOnClickListener {
+                          TaiwanPreviewSession.start(this@TaiwanCarrotWebActivity)
+                          updateNavigation()
+                      }
+                  }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  bottom.addView(Button(this).apply {
+                      text = "瀏覽器開啟"
+                      setOnClickListener {
+                          val url = TaiwanCarrotWebUrl.normalize(urlField.text.toString())
+                          if (url == null) {
+                              Toast.makeText(this@TaiwanCarrotWebActivity, "僅限內網 C4 IP，埠 7000", Toast.LENGTH_LONG).show()
+                          } else startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                      }
+                  }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  root.addView(bottom)
+                  setContentView(root)
+                  updateNavigation()
+              }
+
+              private fun connectWeb() {
+                  val url = TaiwanCarrotWebUrl.normalize(urlField.text.toString())
+                  if (url == null) {
+                      status.text = "地址無效：只接受 C4 區域網路 IP 或 .local，使用 http://IP:7000"
+                      return
+                  }
+                  // Recreate on explicit Connect, rather than leaving video streaming in the background.
+                  releaseWeb("連線準備中")
+                  activeBase = url
+                  getSharedPreferences("tw_carrot_web", MODE_PRIVATE)
+                      .edit().putString("url", url).apply()
+                  val instance = WebView(this)
+                  web = instance
+                  instance.settings.apply {
+                      javaScriptEnabled = true  // Required by Carrot Web HUD/UI.
+                      domStorageEnabled = true
+                      allowFileAccess = false
+                      allowContentAccess = false
+                      setSupportMultipleWindows(false)
+                      mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                      mediaPlaybackRequiresUserGesture = false
+                  }
+                  instance.webChromeClient = WebChromeClient()
+                  instance.webViewClient = object : WebViewClient() {
+                      override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                          if (request == null || !request.isForMainFrame) return false
+                          val destination = request.url.toString()
+                          val accepted = activeBase ?: return true
+                          if (TaiwanCarrotWebUrl.sameDevice(destination, accepted)) return false
+                          status.text = "已封鎖跳轉其他網站：$destination"
+                          return true
+                      }
+
+                      override fun onPageFinished(view: WebView?, url: String?) {
+                          status.text = "Carrot Web 已載入：${url.orEmpty()}。影像與胎壓是否出現取決於車端網頁。"
+                      }
+
+                      override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                          if (request?.isForMainFrame == true) {
+                              status.text = "無法開啟 C4 網頁：${error?.description ?: "網路錯誤"}。請確認 C4 IP、Wi-Fi 和 :7000。"
+                          }
+                      }
+                  }
+                  webHolder.addView(instance, LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                  status.text = "連接 $url …"
+                  instance.loadUrl(url)
+              }
+
+              private fun updateNavigation() {
+                  if (!::navigation.isInitialized) return
+                  val recording = TaiwanPreviewSession.isRecording(this)
+                  val p = getSharedPreferences(TaiwanMapsListener.PREFS, MODE_PRIVATE)
+                  val fresh = System.currentTimeMillis() - p.getLong("last_time", 0L) in 0..15_000L
+                  val text = if (recording && fresh) p.getString("last_text", "").orEmpty()
+                      else "尚無新鮮 Google Maps 導航通知"
+                  navigation.text = "Google ${if (recording) "● 記錄中" else "■ 已停止"}｜" + text.take(140)
+              }
+
+              private fun releaseWeb(reason: String) {
+                  val old = web
+                  web = null
+                  activeBase = null
+                  if (old != null) {
+                      old.stopLoading()
+                      webHolder.removeView(old)
+                      old.loadUrl("about:blank")
+                      old.onPause()
+                      old.destroy()
+                  }
+                  if (::status.isInitialized) status.text = reason
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  handler.removeCallbacks(ticker)
+                  handler.post(ticker)
+              }
+
+              override fun onPause() {
+                  handler.removeCallbacks(ticker)
+                  // User switched to Google Maps / home. The notification listener is independent;
+                  // stop video immediately to avoid battery use and background WebView memory.
+                  releaseWeb("切換到背景，已停止 Web 影像（導航通知仍可在背景接收）")
+                  super.onPause()
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacks(ticker)
+                  releaseWeb("畫面已關閉")
+                  super.onDestroy()
+              }
+          }
+          TW_CARROT_WEB_EOF
+          mkdir -p "app/src/test/java/com/jixiexiaoge/drivingassist"
+          cat > 'app/src/test/java/com/jixiexiaoge/drivingassist/TaiwanCarrotWebUrlTest.kt' <<'TW_CARROT_TEST_EOF'
+          package com.jixiexiaoge.drivingassist
+
+          import org.junit.Assert.*
+          import org.junit.Test
+
+          class TaiwanCarrotWebUrlTest {
+              @Test fun c4TypicalHotspotAddress() {
+                  assertEquals("http://172.20.10.3:7000/", TaiwanCarrotWebUrl.normalize("172.20.10.3"))
+                  assertEquals("http://192.168.1.88:7000/", TaiwanCarrotWebUrl.normalize("http://192.168.1.88:7000"))
+              }
+              @Test fun rejectsExternalAndUnexpectedPorts() {
+                  assertNull(TaiwanCarrotWebUrl.normalize("https://example.com"))
+                  assertNull(TaiwanCarrotWebUrl.normalize("http://8.8.8.8:7000"))
+                  assertNull(TaiwanCarrotWebUrl.normalize("http://192.168.1.5:8082"))
+                  assertNull(TaiwanCarrotWebUrl.normalize("file:///etc/passwd"))
+              }
+              @Test fun navigationRemainsOnSameDevice() {
+                  val base = "http://172.20.10.3:7000/"
+                  assertTrue(TaiwanCarrotWebUrl.sameDevice("http://172.20.10.3:7000/settings", base))
+                  assertFalse(TaiwanCarrotWebUrl.sameDevice("https://172.20.10.3:7000/", base))
+                  assertFalse(TaiwanCarrotWebUrl.sameDevice("http://192.168.1.2:7000/", base))
+              }
+          }
+          TW_CARROT_TEST_EOF
+          cat > 'app/src/test/java/com/jixiexiaoge/drivingassist/TaiwanPreviewParserTest.kt' <<'TW_PREVIEW_EOF_3'
+          package com.jixiexiaoge.drivingassist
+          
+          import org.junit.Assert.*
+          import org.junit.Test
+          
+          class TaiwanPreviewParserTest {
+              @Test fun csvReadsQuotedAddressAndCoordinates() {
+                  val csv = "CityName,Longitude,Latitude,Address,direct,limit\n臺南,120.123,23.123,\"省道,靠右\",南向,60\n"
+                  val points = TaiwanCameraCatalog.parseCsv(csv)
+                  assertEquals(1, points.size)
+                  assertEquals("省道,靠右", points[0].address)
+                  assertEquals("60", points[0].speedLimit)
+              }
+          
+              @Test fun invalidCoordinatesAreIgnored() {
+                  val csv = "Longitude,Latitude,Address\n20,20,invalid\n120.2,23.1,valid\n"
+                  assertEquals(1, TaiwanCameraCatalog.parseCsv(csv).size)
+              }
+          
+              @Test fun nearPointsSortByDistance() {
+                  val p = listOf(
+                      TaiwanCameraCatalog.Camera(23.002, 120.0, "far", "", "60"),
+                      TaiwanCameraCatalog.Camera(23.0001, 120.0, "near", "", "50"),
+                  )
+                  assertEquals("near", TaiwanCameraCatalog.nearest(p, 23.0, 120.0)[0].camera.address)
+              }
+          
+              @Test fun navigationDistancesCanBeParsedWithoutInterpretingTurns() {
+                  assertEquals(550, TaiwanPreviewSession.parseDistanceMeters("550 公尺"))
+                  assertEquals(1500, TaiwanPreviewSession.parseDistanceMeters("1.5 公里"))
+                  assertNull(TaiwanPreviewSession.parseDistanceMeters("前往台一線"))
+              }
+
+              @Test fun googleHintDoesNotClaimPreciseNavigation() {
+                  val hint = TaiwanGoogleNavHint.summarize("500 公尺後右轉")
+                  assertTrue(hint.contains("可能右轉"))
+                  assertTrue(hint.contains("500 公尺"))
+              }
+          }
+          TW_PREVIEW_EOF_3
+          mkdir -p "app/src/debug"
+          cat > 'app/src/debug/AndroidManifest.xml' <<'TW_PREVIEW_EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+              <queries>
+                  <package android:name="com.google.android.apps.maps" />
+              </queries>
+              <!-- This debug variant has NO original app initialization or active Carrot services. -->
+              <application android:name="com.jixiexiaoge.drivingassist.TaiwanPreviewApplication" tools:replace="android:name">
+                  <activity android:name="com.jixiexiaoge.drivingassist.MainActivity" android:enabled="false" />
+                  <service android:name="com.jixiexiaoge.drivingassist.CarrotAmapForegroundService" android:enabled="false" tools:replace="android:enabled" />
+                  <receiver android:name="com.jixiexiaoge.drivingassist.AmapAutoStaticReceiver" android:enabled="false" tools:replace="android:enabled" />
+                  <service android:name="com.navipilot.amap2tesla.projection.ProjectionService" android:enabled="false" />
+                  <service android:name="com.navipilot.amap2tesla.network.TeslaVirtualIpService" android:enabled="false" />
+                  <activity
+                      android:name="com.jixiexiaoge.drivingassist.TaiwanPreviewActivity"
+                      android:exported="true"
+                      android:label="台灣導航測試 v3.6">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name="com.jixiexiaoge.drivingassist.TaiwanCarrotWebActivity"
+                      android:exported="false"
+                      android:label="Carrot Web + Google 導航"
+                      android:windowSoftInputMode="adjustResize" />
+                  <service
+                      android:name="com.jixiexiaoge.drivingassist.TaiwanMapsListener"
+                      android:label="台灣導航通知 v3.6"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          TW_PREVIEW_EOF_4
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          p = Path('app/build.gradle.kts')
+          t = p.read_text()
+          before = 'applicationIdSuffix = ".debug"'
+          assert before in t, "原專案 Debug suffix 已變更，停止而非誤改"
+          p.write_text(t.replace(before, 'applicationIdSuffix = ".taiwanpreviewv36"', 1))
+          PYTHON
+
+      - name: Compile and test preview
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest --tests com.jixiexiaoge.drivingassist.TaiwanPreviewParserTest --tests com.jixiexiaoge.drivingassist.TaiwanCarrotWebUrlTest --no-daemon --stacktrace
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload installable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NaviPilot-Taiwan-Preview-v36-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
