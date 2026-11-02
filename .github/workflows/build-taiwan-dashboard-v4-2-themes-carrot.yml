@@ -1,0 +1,349 @@
+name: Build NaviPilot Taiwan Dashboard v4.2 (themes + Carrot fullscreen + swipe controls)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout NaviPilot source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install Android toolchains
+        shell: bash
+        run: |
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;26.1.10909125' 'cmake;3.22.1'
+          yes | sdkmanager --licenses > /dev/null || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Recreate exact approved v4.1 base from repository
+        shell: bash
+        env:
+          TW_KEYSTORE_B64: ${{ secrets.NAVIPILOT_TW_KEYSTORE_B64 }}
+          TW_KEYSTORE_PASSWORD: ${{ secrets.NAVIPILOT_TW_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_V41_BASE'
+          from pathlib import Path
+          import hashlib, subprocess, os
+          source = Path('.github/workflows/build-taiwan-dashboard-v4-1-permission-wizard.yml')
+          if not source.is_file():
+              raise SystemExit('Missing v4.1 base YAML in the selected branch. Upload it first.')
+          data=source.read_bytes()
+          blob_sha=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\x00'+data).hexdigest()
+          expected='a374ac838029faea47294bde9df811438c420d40'
+          if blob_sha!=expected:
+              raise SystemExit(f'Base v4.1 YAML was modified (SHA {blob_sha}); refusing to run an unreviewed source generator.')
+          requested=[
+              'Inject independent read-only dashboard',
+              'Configure v3.8 map focus, slimmer assets, and stable APK updates',
+              'Add v3.9 general GPS accuracy and road speed preview',
+              'Make v4.0 map-first interface and Google Maps quick-return',
+              'Add v4.1 first-run permission wizard and return check',
+          ]
+          code={}; current=None; recording=False; buf=[]
+          def flush():
+              global buf,recording
+              if current in requested and recording:
+                  if current in code: raise RuntimeError('Duplicate step '+current)
+                  code[current]='\n'.join(buf)+'\n'
+              buf=[];recording=False
+          for line in data.decode('utf-8').splitlines():
+              if line.startswith('      - name: '):
+                  flush();current=line[len('      - name: '):].strip()
+              elif current in requested:
+                  if line == '        run: |':
+                      recording=True;buf=[]
+                  elif recording:
+                      if line.startswith('          '): buf.append(line[10:])
+                      elif line.strip() == '': buf.append('')
+                      else: flush()
+          flush()
+          assert list(code)==requested, f'Expected five base injections in order, got {list(code)}'
+          if not os.environ.get('TW_KEYSTORE_B64') or not os.environ.get('TW_KEYSTORE_PASSWORD'):
+              raise SystemExit('Missing fixed signing secrets; see v3.8 one-time signing setup.')
+          for name in requested:
+              print('Rebuilding approved base step:',name,flush=True)
+              subprocess.run(['bash','-e','-o','pipefail'],input=code[name],text=True,env=os.environ.copy(),check=True)
+          print('All pinned v4.1 base patches applied. Ready for v4.2 UI patch.')
+          PY_V41_BASE
+
+      - name: Add v4.2 fullscreen themes, Carrot zoom, gesture drawer and state feedback
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/navipilot_ui_patch_v42.py <<'PY_V42_PATCH'
+          from pathlib import Path
+          import re
+
+          src = Path('app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashActivity.kt')
+          s = src.read_text(encoding='utf-8')
+
+          def one(old, new, label):
+              global s
+              count = s.count(old)
+              if count != 1:
+                  raise RuntimeError(f'v4.2 patch: expected one {label}; found {count}')
+              s = s.replace(old, new, 1)
+
+          one('import android.app.AlertDialog', '''import android.app.AlertDialog
+          import android.view.MotionEvent
+          import android.widget.FrameLayout
+          import kotlin.math.abs''', 'drawer imports')
+          one('private lateinit var screen: LinearLayout', '''private lateinit var rootFrame: FrameLayout
+              private lateinit var overlayBadge: Button
+              private lateinit var drawerHandle: Button
+              private var cameraLarge = false
+              private var immersiveUi = true
+              private var swipeEligible = false
+              private var swipeStartX = 0f
+              private var swipeStartY = 0f
+              private fun layoutPrefs() = getSharedPreferences("navi_taiwan_layout_v42", MODE_PRIVATE)
+              private lateinit var screen: LinearLayout''','layout fields')
+
+          one('setContentView(screen)', '''rootFrame = FrameLayout(this).apply {
+                      setBackgroundColor(bg)
+                      addView(screen, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                  }
+                  setContentView(rootFrame)
+                  val previousMode = layoutPrefs().getInt("mode", 0)
+                  mapOnly = previousMode == 0
+                  focused = previousMode == 3
+                  cameraLarge = previousMode == 2
+                  immersiveUi = layoutPrefs().getBoolean("immersive", true)''', 'root overlay initialization')
+
+          one('// Initial launch: explain missing permissions; never open system Settings without a tap.', '''createOverlayControls()
+                  // Initial launch: explain missing permissions; never open system Settings without a tap.''', 'create overlays after panel setup')
+
+          # Override the horizontal and portrait split weights without recreating either WebView.
+          one('''content.addView(cameraPanel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.15f).apply { rightMargin = dp(5) })
+                      content.addView(mapPanel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))''','''content.addView(cameraPanel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, if (cameraLarge) 2.7f else 1.15f).apply { rightMargin = dp(5) })
+                      content.addView(mapPanel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, if (cameraLarge) 1.0f else 1f))''','landscape camera-weighted layout')
+          one('''content.addView(cameraPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.46f).apply { bottomMargin = dp(5) })
+                      content.addView(mapPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.54f))''','''content.addView(cameraPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, if (cameraLarge) 0.70f else 0.46f).apply { bottomMargin = dp(5) })
+                      content.addView(mapPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, if (cameraLarge) 0.30f else 0.54f))''','portrait camera-weighted layout')
+
+          one('''screen.addView(titleRow)''', '''screen.addView(titleRow)
+                  titleRow.visibility = if (immersiveUi) View.GONE else View.VISIBLE''','hide top header in immersive mode')
+          one('''screen.addView(footer)
+                  updateScreen()''','''screen.addView(footer)
+                  footer.visibility = if (immersiveUi) View.GONE else View.VISIBLE
+                  applyImmersiveUi()
+                  updateScreen()''','hide permanent controls')
+
+          one('''status.text = if (running) "● 運行中" else "○ 已停止"''', '''status.text = if (running) "● 監測中" else "○ 已停止"
+                  startBtn.text = if (running) "✓ 已開始" else "▶ 開始"
+                  startBtn.isEnabled = !running
+                  startBtn.alpha = if (running) 0.70f else 1f
+                  stopBtn.text = if (running) "■ 停止" else "✓ 已停止"
+                  stopBtn.isEnabled = running
+                  stopBtn.alpha = if (running) 1f else 0.65f
+                  if (::overlayBadge.isInitialized) {
+                      overlayBadge.text = if (running) "● 監測中" else "○ 已停止"
+                      overlayBadge.background = shape(if (running) Color.rgb(7, 95, 66) else panelColor)
+                  }''','visible monitoring state')
+
+          one('''cameraLive = true
+                  mapOnly = false
+                  focused = false
+                  renderLayout()''','''cameraLive = true
+                  val mode = layoutPrefs().getInt("mode", 0)
+                  mapOnly = false  // Reveal video once the driver explicitly connects C4.
+                  focused = mode == 3
+                  cameraLarge = mode == 2
+                  renderLayout()''','preserve camera layout choice on C4 connection')
+
+          # On Android rotation and on return from Google Maps, reapply immersive flags.
+          one('''override fun onResume() {
+                  super.onResume()
+                  returnNotificationManager().cancel(4001)''','''override fun onResume() {
+                  super.onResume()
+                  applyImmersiveUi()
+                  returnNotificationManager().cancel(4001)''','resume immersive flags')
+
+          # Start/stop confirmation when user taps the existing buttons. Real state is persisted in TaiwanDashState.
+          one('''TaiwanDashState.start(this)
+                      startGps()''','''TaiwanDashState.start(this)
+                      Toast.makeText(this, "已開始監測", Toast.LENGTH_SHORT).show()
+                      startGps()''','start state toast')
+          one('''TaiwanDashState.stop(this, reason)
+                  returnNotificationManager().cancel(4001)''','''TaiwanDashState.stop(this, reason)
+                  if (reason == "user_button") Toast.makeText(this, "已停止監測", Toast.LENGTH_SHORT).show()
+                  returnNotificationManager().cancel(4001)''','stop state toast')
+
+          # Drawer, modes, and edge gestures use existing camera/map WebViews: avoid reconnection and avoid intercepting middle-of-map drags.
+          injected=r'''
+              // ---- v4.2 responsive theme / fullscreen drawer. No car-control messages. ----
+              private fun createOverlayControls() {
+                  overlayBadge = button("○ 已停止", panelColor) { showQuickControls() }
+                  rootFrame.addView(overlayBadge, FrameLayout.LayoutParams(dp(102), dp(39), Gravity.TOP or Gravity.END).apply {
+                      topMargin = dp(12)
+                      rightMargin = dp(38)
+                  })
+                  drawerHandle = button("≪", blue) { showQuickControls() }
+                  rootFrame.addView(drawerHandle, FrameLayout.LayoutParams(dp(38), dp(81), Gravity.END or Gravity.CENTER_VERTICAL))
+                  updateScreen()
+              }
+
+              private fun applyImmersiveUi() {
+                  window.decorView.systemUiVisibility = if (immersiveUi) (
+                      View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                          View.SYSTEM_UI_FLAG_FULLSCREEN or
+                          View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                          View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                          View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                          View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                      ) else View.SYSTEM_UI_FLAG_VISIBLE
+              }
+
+              private fun chooseDisplayMode(newMode: Int) {
+                  layoutPrefs().edit().putInt("mode", newMode).apply()
+                  mapOnly = newMode == 0
+                  focused = newMode == 3
+                  cameraLarge = newMode == 2
+                  renderLayout() // Re-parent the same WebViews, preserving stream and map position.
+                  val label = when (newMode) {
+                      0 -> "大地圖主題"
+                      1 -> "均衡雙欄主題"
+                      2 -> "Carrot 大畫面主題"
+                      else -> "Carrot 全螢幕"
+                  }
+                  Toast.makeText(this, "已切換：$label", Toast.LENGTH_SHORT).show()
+              }
+
+              private fun toggleFullscreenUi() {
+                  immersiveUi = !immersiveUi
+                  layoutPrefs().edit().putBoolean("immersive", immersiveUi).apply()
+                  renderLayout()
+                  Toast.makeText(this, if (immersiveUi) "已開啟沉浸式全螢幕" else "已顯示標準工具列", Toast.LENGTH_SHORT).show()
+              }
+
+              private fun showQuickControls() {
+                  val running = TaiwanDashState.enabled(this)
+                  val options = arrayOf(
+                      if (running) "✓ 正在監測（點選無須重複開始）" else "▶ 開始監測",
+                      if (running) "■ 停止監測" else "✓ 已停止監測",
+                      "▣ 大地圖主題",
+                      "▦ 均衡雙欄主題",
+                      "▣ Carrot 大畫面（約 73%）",
+                      "⛶ Carrot 全螢幕影像",
+                      if (immersiveUi) "顯示標準工具列" else "隱藏工具列／全螢幕",
+                      "連接 C4 Carrot Web",
+                      "Google 地圖導航",
+                      "設定與權限"
+                  )
+                  val dialog = AlertDialog.Builder(this)
+                      .setTitle("NaviPilot · 快速控制")
+                      .setItems(options) { _, index ->
+                          when (index) {
+                              0 -> if (!running) startBtn.performClick()
+                              1 -> if (running) stopBtn.performClick()
+                              2 -> chooseDisplayMode(0)
+                              3 -> chooseDisplayMode(1)
+                              4 -> chooseDisplayMode(2)
+                              5 -> chooseDisplayMode(3)
+                              6 -> toggleFullscreenUi()
+                              7 -> connectCarrot()
+                              8 -> openGoogleMaps()
+                              9 -> showOptions()
+                          }
+                      }.create()
+                  dialog.setOnShowListener {
+                      dialog.window?.setGravity(Gravity.BOTTOM)
+                      dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  }
+                  dialog.show()
+              }
+
+              override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+                  if (!::rootFrame.isInitialized) return super.dispatchTouchEvent(ev)
+                  when (ev.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          swipeStartX = ev.x
+                          swipeStartY = ev.y
+                          swipeEligible = ev.x < dp(26) || ev.x > rootFrame.width - dp(26) || ev.y > rootFrame.height - dp(32)
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          val dx = ev.x - swipeStartX
+                          val dy = ev.y - swipeStartY
+                          if (swipeEligible && (abs(dx) >= dp(72) || -dy >= dp(62))) {
+                              swipeEligible = false
+                              showQuickControls()
+                              return true
+                          }
+                          swipeEligible = false
+                      }
+                      MotionEvent.ACTION_CANCEL -> swipeEligible = false
+                  }
+                  return super.dispatchTouchEvent(ev)
+              }
+
+          '''
+          one('    private fun showOptions() {',injected+'    private fun showOptions() {','drawer controls and modes')
+
+          src.write_text(s, encoding='utf-8')
+
+          # Retain stable com.jixiexiaoge.drivingassist.taiwan package and the exact signing key from v3.9 onward.
+          gradle=Path('app/build.gradle.kts')
+          g=gradle.read_text(encoding='utf-8')
+          assert 'applicationIdSuffix = ".taiwan"' in g, 'Stable Taiwan package missing'
+          assert 'signingConfig = signingConfigs.getByName("release")' in g, 'Release signing missing'
+          old='versionName = "4.1.0-permission-wizard"'
+          if g.count(old) != 1:
+              raise RuntimeError('v4.1 version anchor changed')
+          g=g.replace(old,'versionName = "4.2.0-responsive-themes"',1)
+          g, changed=re.subn(r'versionCode = (\d+)',lambda m:f'versionCode = {int(m.group(1))+1_000_000}',g,count=1)
+          if changed != 1: raise RuntimeError('Missing versionCode')
+          gradle.write_text(g,encoding='utf-8')
+
+          manifest=Path('app/src/debug/AndroidManifest.xml')
+          m=manifest.read_text(encoding='utf-8')
+          if m.count('NaviPilot Taiwan 4.1')!=1: raise RuntimeError('v4.1 manifest anchor changed')
+          manifest.write_text(m.replace('NaviPilot Taiwan 4.1','NaviPilot Taiwan 4.2',1),encoding='utf-8')
+          print('v4.2 themes/fullscreen/edge drawer/status feedback installed with stable APK ID/signature')
+          PY_V42_PATCH
+          python3 -m py_compile /tmp/navipilot_ui_patch_v42.py
+          python3 /tmp/navipilot_ui_patch_v42.py
+
+      - name: Compile stable signed APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Verify stable install identity and signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)
+          test -n "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | grep -F "package: name='com.jixiexiaoge.drivingassist.taiwan'"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
+          echo 'Verified stable package ID and signed APK.'
+
+      - name: Upload signed NaviPilot v4.2 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NaviPilot-Taiwan-Dashboard-v42-signed
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
