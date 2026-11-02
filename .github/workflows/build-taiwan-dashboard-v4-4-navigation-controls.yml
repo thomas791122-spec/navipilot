@@ -1,0 +1,1017 @@
+name: Build NaviPilot Taiwan Dashboard v4.4 (monitoring fix + map picking + Google share)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout NaviPilot source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install Android toolchains
+        shell: bash
+        run: |
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;26.1.10909125' 'cmake;3.22.1'
+          yes | sdkmanager --licenses > /dev/null || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Recreate exact approved v4.1 base from repository
+        shell: bash
+        env:
+          TW_KEYSTORE_B64: ${{ secrets.NAVIPILOT_TW_KEYSTORE_B64 }}
+          TW_KEYSTORE_PASSWORD: ${{ secrets.NAVIPILOT_TW_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_V41_BASE'
+          from pathlib import Path
+          import hashlib, subprocess, os
+          source = Path('.github/workflows/build-taiwan-dashboard-v4-1-permission-wizard.yml')
+          if not source.is_file():
+              raise SystemExit('Missing v4.1 base YAML in the selected branch. Upload it first.')
+          data=source.read_bytes()
+          blob_sha=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\x00'+data).hexdigest()
+          expected='a374ac838029faea47294bde9df811438c420d40'
+          if blob_sha!=expected:
+              raise SystemExit(f'Base v4.1 YAML was modified (SHA {blob_sha}); refusing to run an unreviewed source generator.')
+          requested=[
+              'Inject independent read-only dashboard',
+              'Configure v3.8 map focus, slimmer assets, and stable APK updates',
+              'Add v3.9 general GPS accuracy and road speed preview',
+              'Make v4.0 map-first interface and Google Maps quick-return',
+              'Add v4.1 first-run permission wizard and return check',
+          ]
+          code={}; current=None; recording=False; buf=[]
+          def flush():
+              global buf,recording
+              if current in requested and recording:
+                  if current in code: raise RuntimeError('Duplicate step '+current)
+                  code[current]='\n'.join(buf)+'\n'
+              buf=[];recording=False
+          for line in data.decode('utf-8').splitlines():
+              if line.startswith('      - name: '):
+                  flush();current=line[len('      - name: '):].strip()
+              elif current in requested:
+                  if line == '        run: |':
+                      recording=True;buf=[]
+                  elif recording:
+                      if line.startswith('          '): buf.append(line[10:])
+                      elif line.strip() == '': buf.append('')
+                      else: flush()
+          flush()
+          assert list(code)==requested, f'Expected five base injections in order, got {list(code)}'
+          if not os.environ.get('TW_KEYSTORE_B64') or not os.environ.get('TW_KEYSTORE_PASSWORD'):
+              raise SystemExit('Missing fixed signing secrets; see v3.8 one-time signing setup.')
+          for name in requested:
+              print('Rebuilding approved base step:',name,flush=True)
+              subprocess.run(['bash','-e','-o','pipefail'],input=code[name],text=True,env=os.environ.copy(),check=True)
+          print('All pinned v4.1 base patches applied. Ready for v4.2 UI patch.')
+          PY_V41_BASE
+
+      - name: Add v4.2 fullscreen themes, Carrot zoom, gesture drawer and state feedback
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/navipilot_ui_patch_v42.py <<'PY_V42_PATCH'
+          from pathlib import Path
+          import re
+
+          src = Path('app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashActivity.kt')
+          s = src.read_text(encoding='utf-8')
+
+          def one(old, new, label):
+              global s
+              count = s.count(old)
+              if count != 1:
+                  raise RuntimeError(f'v4.2 patch: expected one {label}; found {count}')
+              s = s.replace(old, new, 1)
+
+          one('import android.app.AlertDialog', '''import android.app.AlertDialog
+          import android.view.MotionEvent
+          import android.widget.FrameLayout
+          import kotlin.math.abs''', 'drawer imports')
+          one('private lateinit var screen: LinearLayout', '''private lateinit var rootFrame: FrameLayout
+              private lateinit var overlayBadge: Button
+              private lateinit var drawerHandle: Button
+              private var cameraLarge = false
+              private var immersiveUi = true
+              private var swipeEligible = false
+              private var swipeStartX = 0f
+              private var swipeStartY = 0f
+              private fun layoutPrefs() = getSharedPreferences("navi_taiwan_layout_v42", MODE_PRIVATE)
+              private lateinit var screen: LinearLayout''','layout fields')
+
+          one('setContentView(screen)', '''rootFrame = FrameLayout(this).apply {
+                      setBackgroundColor(bg)
+                      addView(screen, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                  }
+                  setContentView(rootFrame)
+                  val previousMode = layoutPrefs().getInt("mode", 0)
+                  mapOnly = previousMode == 0
+                  focused = previousMode == 3
+                  cameraLarge = previousMode == 2
+                  immersiveUi = layoutPrefs().getBoolean("immersive", true)''', 'root overlay initialization')
+
+          one('// Initial launch: explain missing permissions; never open system Settings without a tap.', '''createOverlayControls()
+                  // Initial launch: explain missing permissions; never open system Settings without a tap.''', 'create overlays after panel setup')
+
+          # Override the horizontal and portrait split weights without recreating either WebView.
+          one('''content.addView(cameraPanel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.15f).apply { rightMargin = dp(5) })
+                      content.addView(mapPanel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))''','''content.addView(cameraPanel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, if (cameraLarge) 2.7f else 1.15f).apply { rightMargin = dp(5) })
+                      content.addView(mapPanel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, if (cameraLarge) 1.0f else 1f))''','landscape camera-weighted layout')
+          one('''content.addView(cameraPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.46f).apply { bottomMargin = dp(5) })
+                      content.addView(mapPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.54f))''','''content.addView(cameraPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, if (cameraLarge) 0.70f else 0.46f).apply { bottomMargin = dp(5) })
+                      content.addView(mapPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, if (cameraLarge) 0.30f else 0.54f))''','portrait camera-weighted layout')
+
+          one('''screen.addView(titleRow)''', '''screen.addView(titleRow)
+                  titleRow.visibility = if (immersiveUi) View.GONE else View.VISIBLE''','hide top header in immersive mode')
+          one('''screen.addView(footer)
+                  updateScreen()''','''screen.addView(footer)
+                  footer.visibility = if (immersiveUi) View.GONE else View.VISIBLE
+                  applyImmersiveUi()
+                  updateScreen()''','hide permanent controls')
+
+          one('''status.text = if (running) "● 運行中" else "○ 已停止"''', '''status.text = if (running) "● 監測中" else "○ 已停止"
+                  startBtn.text = if (running) "✓ 已開始" else "▶ 開始"
+                  startBtn.isEnabled = !running
+                  startBtn.alpha = if (running) 0.70f else 1f
+                  stopBtn.text = if (running) "■ 停止" else "✓ 已停止"
+                  stopBtn.isEnabled = running
+                  stopBtn.alpha = if (running) 1f else 0.65f
+                  if (::overlayBadge.isInitialized) {
+                      overlayBadge.text = if (running) "● 監測中" else "○ 已停止"
+                      overlayBadge.background = shape(if (running) Color.rgb(7, 95, 66) else panelColor)
+                  }''','visible monitoring state')
+
+          one('''cameraLive = true
+                  mapOnly = false
+                  focused = false
+                  renderLayout()''','''cameraLive = true
+                  val mode = layoutPrefs().getInt("mode", 0)
+                  mapOnly = false  // Reveal video once the driver explicitly connects C4.
+                  focused = mode == 3
+                  cameraLarge = mode == 2
+                  renderLayout()''','preserve camera layout choice on C4 connection')
+
+          # On Android rotation and on return from Google Maps, reapply immersive flags.
+          one('''override fun onResume() {
+                  super.onResume()
+                  returnNotificationManager().cancel(4001)''','''override fun onResume() {
+                  super.onResume()
+                  applyImmersiveUi()
+                  returnNotificationManager().cancel(4001)''','resume immersive flags')
+
+          # Start/stop confirmation when user taps the existing buttons. Real state is persisted in TaiwanDashState.
+          one('''TaiwanDashState.start(this)
+                      startGps()''','''TaiwanDashState.start(this)
+                      Toast.makeText(this, "已開始監測", Toast.LENGTH_SHORT).show()
+                      startGps()''','start state toast')
+          one('''TaiwanDashState.stop(this, reason)
+                  returnNotificationManager().cancel(4001)''','''TaiwanDashState.stop(this, reason)
+                  if (reason == "user_button") Toast.makeText(this, "已停止監測", Toast.LENGTH_SHORT).show()
+                  returnNotificationManager().cancel(4001)''','stop state toast')
+
+          # Drawer, modes, and edge gestures use existing camera/map WebViews: avoid reconnection and avoid intercepting middle-of-map drags.
+          injected=r'''
+              // ---- v4.2 responsive theme / fullscreen drawer. No car-control messages. ----
+              private fun createOverlayControls() {
+                  overlayBadge = button("○ 已停止", panelColor) { showQuickControls() }
+                  rootFrame.addView(overlayBadge, FrameLayout.LayoutParams(dp(102), dp(39), Gravity.TOP or Gravity.END).apply {
+                      topMargin = dp(12)
+                      rightMargin = dp(38)
+                  })
+                  drawerHandle = button("≪", blue) { showQuickControls() }
+                  rootFrame.addView(drawerHandle, FrameLayout.LayoutParams(dp(38), dp(81), Gravity.END or Gravity.CENTER_VERTICAL))
+                  updateScreen()
+              }
+
+              private fun applyImmersiveUi() {
+                  window.decorView.systemUiVisibility = if (immersiveUi) (
+                      View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                          View.SYSTEM_UI_FLAG_FULLSCREEN or
+                          View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                          View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                          View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                          View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                      ) else View.SYSTEM_UI_FLAG_VISIBLE
+              }
+
+              private fun chooseDisplayMode(newMode: Int) {
+                  layoutPrefs().edit().putInt("mode", newMode).apply()
+                  mapOnly = newMode == 0
+                  focused = newMode == 3
+                  cameraLarge = newMode == 2
+                  renderLayout() // Re-parent the same WebViews, preserving stream and map position.
+                  val label = when (newMode) {
+                      0 -> "大地圖主題"
+                      1 -> "均衡雙欄主題"
+                      2 -> "Carrot 大畫面主題"
+                      else -> "Carrot 全螢幕"
+                  }
+                  Toast.makeText(this, "已切換：$label", Toast.LENGTH_SHORT).show()
+              }
+
+              private fun toggleFullscreenUi() {
+                  immersiveUi = !immersiveUi
+                  layoutPrefs().edit().putBoolean("immersive", immersiveUi).apply()
+                  renderLayout()
+                  Toast.makeText(this, if (immersiveUi) "已開啟沉浸式全螢幕" else "已顯示標準工具列", Toast.LENGTH_SHORT).show()
+              }
+
+              private fun showQuickControls() {
+                  val running = TaiwanDashState.enabled(this)
+                  val options = arrayOf(
+                      if (running) "✓ 正在監測（點選無須重複開始）" else "▶ 開始監測",
+                      if (running) "■ 停止監測" else "✓ 已停止監測",
+                      "▣ 大地圖主題",
+                      "▦ 均衡雙欄主題",
+                      "▣ Carrot 大畫面（約 73%）",
+                      "⛶ Carrot 全螢幕影像",
+                      if (immersiveUi) "顯示標準工具列" else "隱藏工具列／全螢幕",
+                      "連接 C4 Carrot Web",
+                      "Google 地圖導航",
+                      "設定與權限"
+                  )
+                  val dialog = AlertDialog.Builder(this)
+                      .setTitle("NaviPilot · 快速控制")
+                      .setItems(options) { _, index ->
+                          when (index) {
+                              0 -> if (!running) startBtn.performClick()
+                              1 -> if (running) stopBtn.performClick()
+                              2 -> chooseDisplayMode(0)
+                              3 -> chooseDisplayMode(1)
+                              4 -> chooseDisplayMode(2)
+                              5 -> chooseDisplayMode(3)
+                              6 -> toggleFullscreenUi()
+                              7 -> connectCarrot()
+                              8 -> openGoogleMaps()
+                              9 -> showOptions()
+                          }
+                      }.create()
+                  dialog.setOnShowListener {
+                      dialog.window?.setGravity(Gravity.BOTTOM)
+                      dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  }
+                  dialog.show()
+              }
+
+              override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+                  if (!::rootFrame.isInitialized) return super.dispatchTouchEvent(ev)
+                  when (ev.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          swipeStartX = ev.x
+                          swipeStartY = ev.y
+                          swipeEligible = ev.x < dp(26) || ev.x > rootFrame.width - dp(26) || ev.y > rootFrame.height - dp(32)
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          val dx = ev.x - swipeStartX
+                          val dy = ev.y - swipeStartY
+                          if (swipeEligible && (abs(dx) >= dp(72) || -dy >= dp(62))) {
+                              swipeEligible = false
+                              showQuickControls()
+                              return true
+                          }
+                          swipeEligible = false
+                      }
+                      MotionEvent.ACTION_CANCEL -> swipeEligible = false
+                  }
+                  return super.dispatchTouchEvent(ev)
+              }
+
+          '''
+          one('    private fun showOptions() {',injected+'    private fun showOptions() {','drawer controls and modes')
+
+          src.write_text(s, encoding='utf-8')
+
+          # Retain stable com.jixiexiaoge.drivingassist.taiwan package and the exact signing key from v3.9 onward.
+          gradle=Path('app/build.gradle.kts')
+          g=gradle.read_text(encoding='utf-8')
+          assert 'applicationIdSuffix = ".taiwan"' in g, 'Stable Taiwan package missing'
+          assert 'signingConfig = signingConfigs.getByName("release")' in g, 'Release signing missing'
+          old='versionName = "4.1.0-permission-wizard"'
+          if g.count(old) != 1:
+              raise RuntimeError('v4.1 version anchor changed')
+          g=g.replace(old,'versionName = "4.2.0-responsive-themes"',1)
+          g, changed=re.subn(r'versionCode = (\d+)',lambda m:f'versionCode = {int(m.group(1))+1_000_000}',g,count=1)
+          if changed != 1: raise RuntimeError('Missing versionCode')
+          gradle.write_text(g,encoding='utf-8')
+
+          manifest=Path('app/src/debug/AndroidManifest.xml')
+          m=manifest.read_text(encoding='utf-8')
+          if m.count('NaviPilot Taiwan 4.1')!=1: raise RuntimeError('v4.1 manifest anchor changed')
+          manifest.write_text(m.replace('NaviPilot Taiwan 4.1','NaviPilot Taiwan 4.2',1),encoding='utf-8')
+          print('v4.2 themes/fullscreen/edge drawer/status feedback installed with stable APK ID/signature')
+          PY_V42_PATCH
+          python3 -m py_compile /tmp/navipilot_ui_patch_v42.py
+          python3 /tmp/navipilot_ui_patch_v42.py
+
+      - name: Add v4.3 live map, route geometry and map rotation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/navipilot_patch_v43.py <<'PY_V43_PATCH'
+          from pathlib import Path
+          import re
+          root = Path('app/src/main/java/com/jixiexiaoge/drivingassist')
+          p = root/'TaiwanDashActivity.kt'
+          s = p.read_text(encoding='utf-8')
+          
+          def once(old,new,label):
+              global s
+              n=s.count(old)
+              if n!=1:raise RuntimeError(f'v4.3 anchor {label}: expected 1, found {n}')
+              s=s.replace(old,new,1)
+          
+          once('import android.webkit.WebResourceRequest', 'import android.webkit.JavascriptInterface\nimport android.webkit.WebResourceRequest', 'JS interface import')
+          once('import java.net.URL', 'import java.net.URL\nimport java.net.HttpURLConnection\nimport org.json.JSONObject', 'route JSON imports')
+          once('private var mapOnly = true // Start with map full screen when C4 is not connected.', '''private var mapOnly = true // Start with map full screen when C4 is not connected.
+              // Local-only display state. Routing is requested only after explicit user confirmation.
+              private var orientationMode = 0 // 0 north-up; 1 course-up
+              private var lastReliableBearing = 0f
+              private var routeBusy = false
+              private var routeBanner = ""
+              private var routeJson: String? = null
+              private fun navPrefs() = getSharedPreferences("navi_taiwan_route_v43", MODE_PRIVATE)''', 'orientation and route states')
+          
+          once('''if (quality.accepted && !quality.stationaryDrift) {
+                          lastPosition = Location(location)
+                          publishGps(location)
+                          updateRoadBadge(location)
+                      }''', '''if (quality.accepted && (!quality.stationaryDrift || lastPosition == null)) {
+                          lastPosition = Location(location)
+                          publishGps(location)
+                          publishCourse(location)
+                          updateRoadBadge(location)
+                      } else if (lastPosition == null && location.hasAccuracy() && location.accuracy <= 150f) {
+                          // Show a provisional first fix rather than a blank screen; reject it for speed/route decisions.
+                          lastPosition = Location(location)
+                          publishGps(location)
+                      }''','first fix and heading')
+          
+          once('''immersiveUi = layoutPrefs().getBoolean("immersive", true)
+                  createPanels()''', '''immersiveUi = layoutPrefs().getBoolean("immersive", true)
+                  orientationMode = navPrefs().getInt("orientation", 0)
+                  createPanels()''', 'orientation preference startup')
+          
+          once('''            // Identifies the application when requesting OSM tiles; do not prefetch tiles.
+                      settings.userAgentString''', '''            // Only the locally authored map HTML may call the narrowly scoped route-point bridge.
+                      addJavascriptInterface(RoutePointBridge(), "TaiwanRoutePoint")
+                      // Identifies the application when requesting OSM tiles; do not prefetch tiles.
+                      settings.userAgentString''', 'add bridge')
+          
+          once('''                    mapReady = true
+                              lastPosition?.let { publishGps(it); updateRoadBadge(it) }''', '''                    mapReady = true
+                              map.evaluateJavascript("setOrientationMode($orientationMode)", null)
+                              routeJson?.let { map.evaluateJavascript("setRoute($it)", null) }
+                              lastPosition?.let { publishGps(it); publishCourse(it); updateRoadBadge(it) }''', 'map ready restore')
+          
+          once('''        createOverlayControls()
+                  // Initial launch''', '''        createOverlayControls()
+                  // Always display current location in the foreground; monitoring is independently optional.
+                  if (hasPermission()) startGps()
+                  // Initial launch''', 'initial location')
+          
+          once('''            "Google 地圖導航",
+                      "設定與權限"''', '''            "Google 地圖導航",
+                      "設定與權限",
+                      if (orientationMode == 0) "🧭 地圖：北朝上 → 車頭朝上" else "🧭 地圖：車頭朝上 → 北朝上",
+                      "📍 設定目的地（長按地圖或輸入座標）",
+                      "↻ 手動重新計算路線",
+                      "✕ 清除規劃路線"''', 'quick menu extra items')
+          
+          once('''                    9 -> showOptions()
+                          }
+                      }.create()''', '''                    9 -> showOptions()
+                              10 -> toggleOrientationMode()
+                              11 -> showDestinationDialog()
+                              12 -> showRecalculatePrompt()
+                              13 -> clearRoute()
+                          }
+                      }.create()''', 'quick menu extra actions')
+          
+          once('''        val items = arrayOf("更改 C4 IP", "匯入台灣測速 CSV", "下載官方固定測速資料", "檢查 NaviPilot 通知存取權", "開啟 Google 地圖", "分享診斷 Log", "清除舊診斷 Log", "分享 GPS 精度報告", "停車查附近道路速限", "自動速限查詢授權", "權限設定／重新檢查")''', '''        val items = arrayOf("更改 C4 IP", "匯入台灣測速 CSV", "下載官方固定測速資料", "檢查 NaviPilot 通知存取權", "開啟 Google 地圖", "分享診斷 Log", "清除舊診斷 Log", "分享 GPS 精度報告", "停車查附近道路速限", "自動速限查詢授權", "權限設定／重新檢查", "地圖方向：北朝上／車頭朝上", "規劃路線：設定目的地")''', 'settings options')
+          
+          once('''                10 -> showPermissionWizard(true)
+                          6 ->''', '''                10 -> showPermissionWizard(true)
+                          11 -> toggleOrientationMode()
+                          12 -> showDestinationDialog()
+                          6 ->''', 'settings actions')
+          
+          once('''    private fun startGps() {
+                  if (!TaiwanDashState.enabled(this) || gpsStarted) return''', '''    private fun startGps() {
+                  if (gpsStarted) return''', 'foreground location independent')
+          
+          once('''        if (requestCode == 91 && hasPermission()) startGps()''', '''        if ((requestCode == 91 || requestCode == 194) && hasPermission()) startGps()''', 'start map after permission grant')
+          
+          once('''        if (TaiwanDashState.enabled(this)) startGps()
+                  if (cameraLive) connectCarrot()''', '''        if (hasPermission()) startGps()
+                  if (cameraLive) connectCarrot()''', 'resume location')
+          
+          once('''        if (!TaiwanDashState.enabled(this) || !mapReady || !l.latitude.isFinite() || !l.longitude.isFinite()) return''', '''        if (!mapReady || !l.latitude.isFinite() || !l.longitude.isFinite()) return''', 'publish location when stopped')
+          
+          once('''        if (!running && gpsStarted) stopGps()''', '''        // A stopped monitoring session must NOT stop the foreground GPS map.''', 'keep foreground location')
+          
+          once('''        TaiwanDashState.stop(this, reason)
+                  if (reason == "user_button")''', '''        TaiwanDashState.stop(this, reason)
+                  if (reason == "user_button")''', 'stop preserve')
+          # The stopEverything function stops GPS; remove this only there.
+          once('''        returnNotificationManager().cancel(4001)
+                  stopGps()
+                  cameraLive = false''', '''        returnNotificationManager().cancel(4001)
+                  // Map continues following location until the Activity leaves the foreground.
+                  cameraLive = false''','stop monitoring keeps map gps')
+          
+          once('''        banner.text = if (fresh) "${nav.first}｜${nav.second.take(26)}" else "開啟 Google 地圖開始導航"''', '''        banner.text = if (routeBanner.isNotBlank()) routeBanner else if (fresh) "${nav.first}｜${nav.second.take(26)}" else "長按地圖選目的地，規劃藍色路線"''', 'route banner fallback')
+          
+          # New code is intentionally read-only and independent of the comma 4 control protocol.
+          new_methods=r'''
+              // ----- v4.3 map orientation and optional route preview -----
+              private fun toggleOrientationMode() {
+                  orientationMode = if (orientationMode == 0) 1 else 0
+                  navPrefs().edit().putInt("orientation", orientationMode).apply()
+                  if (mapReady) map.evaluateJavascript("setOrientationMode($orientationMode)", null)
+                  lastPosition?.let { publishCourse(it) }
+                  Toast.makeText(this, if (orientationMode == 0) "地圖已固定北方朝上" else "行進方向朝上：移動後開始旋轉", Toast.LENGTH_SHORT).show()
+              }
+          
+              private fun publishCourse(location: Location) {
+                  // GPS course becomes unreliable at low speed; hold the last valid bearing.
+                  if (location.hasBearing() && location.hasSpeed() && location.speed >= 2.2f &&
+                      (!location.hasAccuracy() || location.accuracy <= 35f)) {
+                      lastReliableBearing = location.bearing
+                  }
+                  if (mapReady) map.evaluateJavascript("setHeading(${lastReliableBearing.toDouble()})", null)
+              }
+          
+              private inner class RoutePointBridge {
+                  @JavascriptInterface fun selected(lat: Double, lon: Double) {
+                      if (!lat.isFinite() || !lon.isFinite() || kotlin.math.abs(lat) > 85 || kotlin.math.abs(lon) > 180) return
+                      runOnUiThread { if (!isFinishing && !isDestroyed) confirmRoute(lat, lon) }
+                  }
+              }
+          
+              private fun showDestinationDialog() {
+                  val input = EditText(this).apply { setSingleLine(true); hint = "緯度,經度，例如 22.997,120.220" }
+                  AlertDialog.Builder(this).setTitle("設定目的地")
+                      .setMessage("可以直接長按地圖設定，或輸入目的地的緯度,經度。")
+                      .setView(input)
+                      .setPositiveButton("確認") { _, _ ->
+                          val parts = input.text.toString().split(',', '，').map { it.trim() }
+                          val lat = parts.getOrNull(0)?.toDoubleOrNull()
+                          val lon = parts.getOrNull(1)?.toDoubleOrNull()
+                          if (lat == null || lon == null || !lat.isFinite() || !lon.isFinite() || kotlin.math.abs(lat)>85 || kotlin.math.abs(lon)>180) {
+                              Toast.makeText(this, "座標格式應為：緯度,經度", Toast.LENGTH_LONG).show()
+                          } else confirmRoute(lat, lon)
+                      }.setNegativeButton("取消", null).show()
+              }
+          
+              private fun confirmRoute(destLat: Double, destLon: Double) {
+                  val start = lastPosition
+                  if (start == null || System.currentTimeMillis() - start.time > 120_000L ||
+                      !start.hasAccuracy() || start.accuracy > 75f) {
+                      Toast.makeText(this, "等待目前定位精度改善後再規劃路線", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  AlertDialog.Builder(this).setTitle("規劃導航路線（測試）")
+                      .setMessage("將目前 GPS 座標與目的地傳給公開 OSRM 試用服務，取得汽車道路路線。這條路線不是 Google Maps 的原路線，服務不保證可用，也不控制 C4。是否繼續？")
+                      .setPositiveButton("同意並計算") { _, _ -> fetchRoute(start.latitude, start.longitude, destLat, destLon) }
+                      .setNegativeButton("取消", null).show()
+              }
+          
+              private var destPoint: Pair<Double, Double>? = null
+              private fun showRecalculatePrompt() {
+                  val end=destPoint
+                  if(end==null) { Toast.makeText(this, "請先長按地圖設定目的地", Toast.LENGTH_SHORT).show(); return }
+                  confirmRoute(end.first,end.second)
+              }
+          
+              private fun fetchRoute(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double) {
+                  if (routeBusy) return
+                  routeBusy = true
+                  Toast.makeText(this, "正在取得路線…", Toast.LENGTH_SHORT).show()
+                  thread(name="taiwan-route-preview") {
+                      val result = runCatching {
+                          val endpoint="https://router.project-osrm.org/route/v1/driving/$fromLon,$fromLat;$toLon,$toLat?overview=full&geometries=geojson&steps=false"
+                          val conn=URL(endpoint).openConnection() as HttpURLConnection
+                          try {
+                              conn.connectTimeout=10000; conn.readTimeout=12000
+                              conn.setRequestProperty("Accept", "application/json")
+                              conn.setRequestProperty("User-Agent", "NaviPilotTaiwan/4.3 private-routing-preview")
+                              if (conn.responseCode != 200) throw IllegalStateException("路線服務 HTTP ${conn.responseCode}")
+                              val body=conn.inputStream.bufferedReader().use { it.readText().take(1_600_001) }
+                              if(body.length>1_600_000) throw IllegalStateException("路線資料過大")
+                              val json=JSONObject(body)
+                              if(json.optString("code")!="Ok") throw IllegalStateException("路線服務無法規劃此路線")
+                              val route=json.getJSONArray("routes").getJSONObject(0)
+                              val geometry=route.getJSONObject("geometry").getJSONArray("coordinates")
+                              if(geometry.length()<2 || geometry.length()>18000) throw IllegalStateException("路線座標數量不合理")
+                              Triple(geometry.toString(),route.optDouble("distance"),route.optDouble("duration"))
+                          } finally { conn.disconnect() }
+                      }
+                      runOnUiThread {
+                          routeBusy = false
+                          if (isFinishing || isDestroyed) return@runOnUiThread
+                          result.onSuccess { (coords,metres,seconds) ->
+                              routeJson=coords
+                              destPoint=Pair(toLat,toLon)
+                              routeBanner="獨立路線 ${(metres/1000.0).let { String.format(java.util.Locale.US,"%.1f",it) }} km · 約 ${(seconds/60.0).toInt()} 分鐘"
+                              if(mapReady) map.evaluateJavascript("setRoute($coords)", null)
+                              updateScreen()
+                              Toast.makeText(this,"已繪製 OSRM 導航路線",Toast.LENGTH_SHORT).show()
+                          }.onFailure { ex ->
+                              Toast.makeText(this,"路線規劃失敗：${ex.message.orEmpty().take(85)}",Toast.LENGTH_LONG).show()
+                          }
+                      }
+                  }
+              }
+          
+              private fun clearRoute() {
+                  routeJson=null
+                  routeBanner=""
+                  destPoint=null
+                  if(mapReady) map.evaluateJavascript("setRoute([])",null)
+                  updateScreen()
+              }
+          
+          '''
+          once('    private fun hasPermission() =', new_methods+'    private fun hasPermission() =','route and orientation functions')
+          
+          # Do not use realtime OSRM re-routing automatically; the endpoint is a public non-commercial demo.
+          p.write_text(s,encoding='utf-8')
+          
+          m=Path('app/src/main/assets/tw_dashboard_map.html')
+          h=m.read_text(encoding='utf-8')
+          assert h.count('<div id="tiles"></div><svg id="trace"></svg><div id="cams"></div>') == 1
+          h=h.replace('<div id="tiles"></div><svg id="trace"></svg><div id="cams"></div>', '<div id="mapWorld"><div id="tiles"></div><svg id="trace"></svg><svg id="routePath"></svg><div id="cams"></div><div id="destPin"></div></div>',1)
+          h=h.replace('const tiles=document.getElementById(\'tiles\'),svg=document.getElementById(\'trace\');', 'const tiles=document.getElementById(\'tiles\'),svg=document.getElementById(\'trace\');let routePoints=[],northMode=0,heading=0;',1)
+          # The extra world margin keeps map tiles covering corners when rotated; control overlays stay unrotated.
+          css=r'''#mapWorld{position:absolute;left:50%;top:50%;width:100%;height:100%;transform-origin:50% 50%;pointer-events:auto}
+          #tiles{position:absolute;inset:0}#routePath{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:5}
+          #trace{z-index:4}#destPin{position:absolute;width:18px;height:18px;border-radius:50% 50% 50% 0;transform:translate(-50%,-80%) rotate(-45deg);background:#ffcf26;border:2px solid white;box-shadow:0 0 10px #000;z-index:8;display:none;pointer-events:none}
+          #center:after{content:'▲';position:absolute;left:0;top:-4px;width:100%;text-align:center;font-size:24px;color:#fff;text-shadow:0 1px 2px #000}
+          #mapMode{position:absolute;left:8px;top:8px;z-index:30;color:#fff;background:#101a2cdd;border:1px solid #7ba2d2;border-radius:6px;padding:5px 8px;font-size:12px}
+          #routeHint{position:absolute;left:7px;top:44px;z-index:30;background:#122440b8;border-radius:5px;padding:4px 7px;font-size:10px;pointer-events:none}
+          '''
+          assert h.count('</style></head><body>')==1
+          h=h.replace('</style></head><body>',css+'</style></head><body>',1)
+          h=h.replace('<div id="gpsPill">GPS --</div>', '<div id="gpsPill">GPS --</div><button type="button" id="mapMode" onclick="toggleOrientation()">北朝上</button><div id="routeHint">長按地圖選目的地</div>',1)
+          h=h.replace("const markers=document.getElementById(\"cams\");", "renderRoute(w,h,p);const markers=document.getElementById(\"cams\");",1)
+          h=h.replace('function render(){if(lat===null)return;', 'function render(){if(lat===null)return;ensureWorld();',1)
+          
+          # Complete route rendering and course-up rotation including map long press.
+          js=r'''
+          function ensureWorld(){const m=document.getElementById('map'),side=Math.ceil(Math.hypot(m.clientWidth,m.clientHeight))+256;const world=document.getElementById('mapWorld');if(world.style.width!==side+'px'){world.style.width=side+'px';world.style.height=side+'px';}}
+          function renderRoute(w,h,p){
+           const node=document.getElementById('routePath');node.setAttribute('viewBox','0 0 '+w+' '+h);
+           const pts=routePoints.map(c=>{let q=project(c[1],c[0]);return (q.x-p.x+w/2).toFixed(1)+','+(q.y-p.y+h/2).toFixed(1)}).join(' ');
+           node.innerHTML=pts?'<polyline points="'+pts+'" stroke="#0e2236" stroke-width="13" fill="none" stroke-linejoin="round" stroke-linecap="round"/><polyline points="'+pts+'" stroke="#19a5ff" stroke-width="7" fill="none" stroke-linejoin="round" stroke-linecap="round"/>':'';
+           const pin=document.getElementById('destPin');if(routePoints.length){let c=routePoints[routePoints.length-1],q=project(c[1],c[0]);pin.style.left=(q.x-p.x+w/2)+'px';pin.style.top=(q.y-p.y+h/2)+'px';pin.style.display='block';}else pin.style.display='none';
+          }
+          function setRoute(coords){
+           routePoints=Array.isArray(coords)?coords.filter(c=>Array.isArray(c)&&c.length>=2&&Number.isFinite(c[0])&&Number.isFinite(c[1])).slice(0,18000):[];
+           document.getElementById('routeHint').textContent=routePoints.length?'藍線＝NaviPilot 獨立規劃（非 Google）':'長按地圖選目的地';render();
+          }
+          function applyHeading(){
+           let rotate=(northMode===1?-heading:0);
+           document.getElementById('mapWorld').style.transform='translate(-50%,-50%) rotate('+rotate+'deg)';
+           // Center arrow always faces driving direction in north-up, faces top in course-up.
+           document.getElementById('center').style.transform='translate(-50%,-50%) rotate('+(northMode===1?0:heading)+'deg)';
+           document.getElementById('mapMode').textContent=northMode===1?'車頭朝上':'北朝上';
+          }
+          function setOrientationMode(mode){northMode=mode===1?1:0;applyHeading();}
+          function setHeading(degrees){if(!Number.isFinite(degrees))return;heading=((degrees%360)+360)%360;applyHeading();}
+          function toggleOrientation(){setOrientationMode(1-northMode);try{TaiwanRoutePoint.setMode(northMode);}catch(e){}}
+          function coordsAt(clientX,clientY){
+           if(lat===null)return null;const r=document.getElementById('map').getBoundingClientRect();
+           let dx=clientX-r.left-r.width/2,dy=clientY-r.top-r.height/2;
+           const t=(northMode===1?heading:0)*Math.PI/180;
+           let ux=dx*Math.cos(t)-dy*Math.sin(t),uy=dx*Math.sin(t)+dy*Math.cos(t);
+           const p=project(lat,lon),scale=256*Math.pow(2,z),px=p.x+ux,py=p.y+uy;
+           return [(Math.atan(Math.sinh(Math.PI*(1-2*py/scale)))*180/Math.PI),(px/scale*360-180)];
+          }
+          let holdTimer=null,holdX=0,holdY=0;
+          const mapEl=document.getElementById('map');
+          mapEl.addEventListener('pointerdown',e=>{if(e.target.closest('button'))return;holdX=e.clientX;holdY=e.clientY;clearTimeout(holdTimer);holdTimer=setTimeout(()=>{let c=coordsAt(holdX,holdY);if(c)try{TaiwanRoutePoint.selected(c[0],c[1])}catch(e){};holdTimer=null;},700);});
+          mapEl.addEventListener('pointermove',e=>{if(Math.abs(e.clientX-holdX)+Math.abs(e.clientY-holdY)>14)clearTimeout(holdTimer)});
+          mapEl.addEventListener('pointerup',()=>clearTimeout(holdTimer));mapEl.addEventListener('pointercancel',()=>clearTimeout(holdTimer));
+          mapEl.addEventListener('contextmenu',e=>e.preventDefault());
+          '''
+          assert h.count('</script></body></html>')==1
+          h=h.replace('</script></body></html>',js+'</script></body></html>',1)
+          m.write_text(h,encoding='utf-8')
+          
+          # Native callbacks for the on-map heading mode button (same preference as quick drawer)
+          s=p.read_text(encoding='utf-8')
+          anchor='''        @JavascriptInterface fun selected(lat: Double, lon: Double) {'''
+          assert s.count(anchor)==1
+          s=s.replace(anchor,'''        @JavascriptInterface fun setMode(mode: Int) {
+                      if (mode !in 0..1) return
+                      runOnUiThread {
+                          orientationMode = mode
+                          navPrefs().edit().putInt("orientation", mode).apply()
+                      }
+                  }
+                  @JavascriptInterface fun selected(lat: Double, lon: Double) {''',1)
+          p.write_text(s,encoding='utf-8')
+          
+          gradle=Path('app/build.gradle.kts');g=gradle.read_text(encoding='utf-8')
+          assert g.count('versionName = "4.2.0-responsive-themes"')==1
+          assert 'applicationIdSuffix = ".taiwan"' in g
+          assert 'signingConfig = signingConfigs.getByName("release")' in g
+          g=g.replace('versionName = "4.2.0-responsive-themes"','versionName = "4.3.0-route-heading-preview"',1)
+          g,n=re.subn(r'versionCode = (\d+)',lambda m:f'versionCode = {int(m.group(1))+1000000}',g,count=1)
+          assert n==1
+          gradle.write_text(g,encoding='utf-8')
+          manifest=Path('app/src/debug/AndroidManifest.xml');s=manifest.read_text(encoding='utf-8')
+          assert s.count('NaviPilot Taiwan 4.2')==1
+          manifest.write_text(s.replace('NaviPilot Taiwan 4.2','NaviPilot Taiwan 4.3',1),encoding='utf-8')
+          print('v4.3 foreground map location, manual OSRM route geometry, north/course up and stable signed upgrade patched.')
+          PY_V43_PATCH
+          python3 -m py_compile /tmp/navipilot_patch_v43.py
+          python3 /tmp/navipilot_patch_v43.py
+          python3 - <<'PY_V43_JS'
+          from pathlib import Path
+          import re
+          h=Path('app/src/main/assets/tw_dashboard_map.html').read_text(encoding='utf-8')
+          j=re.search(r'<script>([\s\S]+?)</script>', h)
+          assert j is not None, 'Map JavaScript not found'
+          Path('/tmp/taiwan_v43_map.js').write_text(j.group(1), encoding='utf-8')
+          PY_V43_JS
+          node --check /tmp/taiwan_v43_map.js
+
+      - name: Add v4.4 reliable monitoring, categorized menu and destination sharing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/navipilot_patch_v44.py <<'PY_V44_PATCH'
+          from pathlib import Path
+          import re
+
+          root = Path('app/src/main/java/com/jixiexiaoge/drivingassist')
+          src = root / 'TaiwanDashActivity.kt'
+          s = src.read_text(encoding='utf-8')
+
+          def once(old, new, name):
+              global s
+              n=s.count(old)
+              if n != 1: raise RuntimeError(f'v4.4 {name}: expected 1 anchor; found {n}')
+              s=s.replace(old,new,1)
+
+          once('import android.app.AlertDialog', 'import android.app.AlertDialog\nimport java.net.URLDecoder', 'Google share URL parsing')
+
+          # Explicit feedback visible in the overlay and via a toast, even when footer is hidden.
+          # Fix stale NAV records from past sessions leading to immediate automatic stop.
+          state = root/'TaiwanDashState.kt'
+          st = state.read_text(encoding='utf-8')
+          a='p(c).edit().putBoolean("enabled", true).putLong("started", System.currentTimeMillis()).apply()'
+          assert st.count(a)==1
+          st=st.replace(a,'p(c).edit().putBoolean("enabled", true).putLong("started", System.currentTimeMillis())\n            .putLong("last_nav", 0L).putInt("last_id", Int.MIN_VALUE).putBoolean("has_nav", false).apply()',1)
+          state.write_text(st,encoding='utf-8')
+
+          # Keep session management independent of map, and don't use hidden button performClick.
+          a='''    private fun showQuickControls() {'''
+          b='''    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {'''
+          assert s.count(a)==1 and s.count(b)==1
+          start=s.index(a);end=s.index(b,start)
+          menus=r'''    // Compact, categorised controls. Same map and Carrot WebView across themes.
+              private fun showQuickControls() {
+                  val running = TaiwanDashState.enabled(this)
+                  val opts = arrayOf(
+                      if (running) "■ 停止監測（目前：監測中）" else "▶ 開始監測（目前：已停止）",
+                      "🧭 導航與目的地",
+                      "🎨 顯示樣式",
+                      "📷 Carrot Web／胎壓",
+                      "⚙ 權限與診斷"
+                  )
+                  AlertDialog.Builder(this).setTitle("NaviPilot · 控制中心")
+                      .setItems(opts) { _, n -> when (n) {
+                          0 -> toggleMonitoringNow()
+                          1 -> showNavigationControls()
+                          2 -> showDisplayControls()
+                          3 -> showCarrotControls()
+                          4 -> showOptions()
+                      }}.show()
+              }
+
+              private fun toggleMonitoringNow() {
+                  if (TaiwanDashState.enabled(this)) {
+                      stopEverything("user_button")
+                  } else {
+                      TaiwanDashState.start(this)
+                      startGps()
+                      updateScreen()
+                      Toast.makeText(this, "已開始監測 · 地圖持續定位", Toast.LENGTH_LONG).show()
+                  }
+                  updateScreen()
+              }
+
+              private fun showNavigationControls() {
+                  val items = arrayOf(
+                      "📍 在地圖點一下選目的地",
+                      "🔗 匯入 Google Maps 分享連結",
+                      "🗺 開啟 Google Maps",
+                      if (orientationMode == 0) "🧭 改為車頭朝上" else "🧭 改為北朝上",
+                      "↻ 重新規劃目前路線",
+                      "✕ 清除規劃路線"
+                  )
+                  AlertDialog.Builder(this).setTitle("導航與路線")
+                      .setItems(items) { _, i -> when(i) {
+                          0 -> beginMapPicking()
+                          1 -> askForSharedLink()
+                          2 -> openGoogleMaps()
+                          3 -> toggleOrientationMode()
+                          4 -> showRecalculatePrompt()
+                          5 -> clearRoute()
+                      }}.show()
+              }
+
+              private fun showDisplayControls() {
+                  val items = arrayOf(
+                      "大地圖", "均衡雙欄", "Carrot 大畫面（約 73%）", "Carrot 全螢幕",
+                      if (immersiveUi) "顯示 Android 工具列" else "隱藏工具列（沉浸全螢幕）"
+                  )
+                  AlertDialog.Builder(this).setTitle("顯示樣式")
+                      .setSingleChoiceItems(items, layoutPrefs().getInt("mode",0)) { d,i ->
+                          d.dismiss()
+                          if(i in 0..3) chooseDisplayMode(i) else toggleFullscreenUi()
+                      }.show()
+              }
+
+              private fun showCarrotControls() {
+                  val items = arrayOf("連接 C4", "修改 C4 IP", "Carrot 大畫面", "Carrot 全螢幕", "返回大地圖")
+                  AlertDialog.Builder(this).setTitle("Carrot Web／胎壓")
+                      .setItems(items) { _, i -> when(i) {
+                          0 -> connectCarrot()
+                          1 -> editCarrotAddress()
+                          2 -> chooseDisplayMode(2)
+                          3 -> chooseDisplayMode(3)
+                          4 -> chooseDisplayMode(0)
+                      }}.show()
+              }
+
+              private fun beginMapPicking() {
+                  chooseDisplayMode(0)
+                  if (!mapReady) { Toast.makeText(this,"正在載入地圖，請稍後再試",Toast.LENGTH_LONG).show(); return }
+                  map.evaluateJavascript("setPickingMode(true)",null)
+                  Toast.makeText(this,"選點模式：點一下地圖位置，再確認導航",Toast.LENGTH_LONG).show()
+              }
+
+              private fun askForSharedLink() {
+                  val input=EditText(this).apply {
+                      setSingleLine(false); minLines=2
+                      hint="貼上 Google Maps 分享連結或緯度,經度"
+                  }
+                  AlertDialog.Builder(this).setTitle("匯入 Google Maps 目的地")
+                      .setView(input)
+                      .setPositiveButton("辨識位置") { _, _ -> resolveSharedPlace(input.text.toString()) }
+                      .setNegativeButton("取消",null).show()
+              }
+
+              private fun handleSharedIntent(incoming: Intent?) {
+                  if (incoming?.action != Intent.ACTION_SEND || incoming.type != "text/plain") return
+                  val value=incoming.getStringExtra(Intent.EXTRA_TEXT).orEmpty().take(2048)
+                  if (value.isBlank()) return
+                  AlertDialog.Builder(this).setTitle("從 Google Maps 匯入目的地？")
+                      .setMessage("辨識分享連結中的目的地座標。短網址可能需要連上 Google 才能展開；NaviPilot 會在你確認後才計算路線。")
+                      .setPositiveButton("辨識目的地") { _, _ -> resolveSharedPlace(value) }
+                      .setNegativeButton("取消",null).show()
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  handler.post { if(!isFinishing && !isDestroyed) handleSharedIntent(intent) }
+              }
+
+              private fun validPoint(lat: Double, lon: Double): Pair<Double,Double>? =
+                  if (lat.isFinite() && lon.isFinite() && lat in -85.0..85.0 && lon in -180.0..180.0)
+                      Pair(lat,lon) else null
+
+              // Extract known coordinate-bearing formats. A Google Maps link is not a route API.
+              private fun coordinatesInSharedText(raw: String): Pair<Double,Double>? {
+                  val text=runCatching { URLDecoder.decode(raw.take(4096).replace("+","%2B"),"UTF-8") }.getOrDefault(raw.take(4096))
+                  val number="(-?\\d{1,3}(?:\\.\\d+)?)"
+                  fun match(pattern: String): Pair<Double,Double>? {
+                      val m=Regex(pattern,RegexOption.IGNORE_CASE).find(text) ?: return null
+                      val a=m.groupValues[1].toDoubleOrNull() ?: return null
+                      val b=m.groupValues[2].toDoubleOrNull() ?: return null
+                      return validPoint(a,b)
+                  }
+                  return match("!3d$number!4d$number")
+                      ?: match("(?:destination|daddr|query|q|ll)=$number,$number")
+                      ?: match("(?:geo:|coords:)$number,$number")
+                      ?: match("(?<![0-9])$number\\s*,\\s*$number(?![0-9])")
+                      ?: match("/@$number,$number") // Last resort: often map centre, may be imprecise.
+              }
+
+              private fun resolveSharedPlace(raw: String) {
+                  val direct=coordinatesInSharedText(raw)
+                  if (direct != null) { showImportedPlace(direct); return }
+                  val short=Regex("https?://[^\\s<>\\\"]+", RegexOption.IGNORE_CASE).find(raw)?.value?.trimEnd('.',',',')')
+                  val host=runCatching { URI(short).host.orEmpty().lowercase(java.util.Locale.US) }.getOrDefault("")
+                  val allowed=host in listOf("maps.app.goo.gl","goo.gl","www.google.com","google.com","maps.google.com","www.google.com.tw")
+                  if (short == null || !allowed) {
+                      Toast.makeText(this,"分享內容沒有可辨識的座標，請用地圖選點",Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  Toast.makeText(this,"正在辨識 Google Maps 短網址…",Toast.LENGTH_SHORT).show()
+                  thread(name="navi-share-link") {
+                      val p=runCatching {
+                          val conn=URL(short).openConnection() as HttpURLConnection
+                          try {
+                              conn.instanceFollowRedirects=true
+                              conn.connectTimeout=6000;conn.readTimeout=6000
+                              conn.setRequestProperty("User-Agent","Mozilla/5.0 NaviPilotTaiwan/4.4")
+                              if(conn.responseCode !in 200..399) throw IllegalStateException("Google 分享連結無法展開")
+                              val finalUrl=conn.url.toString()
+                              val finalHost=URI(finalUrl).host.orEmpty().lowercase(java.util.Locale.US)
+                              if (!finalHost.endsWith("google.com") && !finalHost.endsWith("google.com.tw") &&
+                                  finalHost!="maps.app.goo.gl") throw IllegalStateException("非 Google 網址")
+                              coordinatesInSharedText(finalUrl)
+                          } finally { conn.disconnect() }
+                      }.getOrNull()
+                      runOnUiThread {
+                          if(isDestroyed || isFinishing) return@runOnUiThread
+                          if(p != null) showImportedPlace(p)
+                          else AlertDialog.Builder(this).setTitle("尚無法辨識目的地")
+                              .setMessage("Google 分享短網址不一定含座標。可回到 NaviPilot 地圖，使用『選目的地』點一下位置；Google 原路線不會直接匯入。")
+                              .setPositiveButton("選地圖位置") { _, _ -> beginMapPicking() }
+                              .setNegativeButton("關閉",null).show()
+                      }
+                  }
+              }
+
+              private fun showImportedPlace(point: Pair<Double,Double>) {
+                  val text=String.format(java.util.Locale.US,"%.6f, %.6f",point.first,point.second)
+                  AlertDialog.Builder(this).setTitle("確認目的地")
+                      .setMessage("辨識到座標：$text\n將使用 NaviPilot 獨立計算路線，不會複製 Google Maps 的路線。")
+                      .setPositiveButton("規劃路線") { _, _ -> chooseDisplayMode(0); confirmRoute(point.first,point.second) }
+                      .setNegativeButton("取消",null).show()
+              }
+
+          '''
+          s=s[:start]+menus+s[end:]
+
+          # Organise the older long Settings list into small, purposeful groups.
+          settings_menu=r'''
+              private fun showOptions() {
+                  val items=arrayOf("🔐 權限設定", "🚦 測速與道路速限", "📊 GPS／診斷工具", "🌐 Google 地圖", "📷 C4 連線設定", "⚙ 更多進階項目")
+                  AlertDialog.Builder(this).setTitle("設定與工具")
+                      .setItems(items) { _, i -> when(i) {
+                          0 -> showPermissionWizard(true)
+                          1 -> AlertDialog.Builder(this).setTitle("道路資料與速限")
+                              .setItems(arrayOf("啟用或關閉 OSM 候選速限", "停車查附近道路速限", "下載台灣官方固定測速資料", "匯入固定測速 CSV")) { _, n -> when(n) {
+                                  0 -> configureRoadLookupConsent()
+                                  1 -> lookupNearbySpeedLimit()
+                                  2 -> downloadCameras()
+                                  3 -> startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {addCategory(Intent.CATEGORY_OPENABLE);type="*/*"},202)
+                              }}.show()
+                          2 -> AlertDialog.Builder(this).setTitle("GPS 與診斷")
+                              .setItems(arrayOf("分享 GPS 精度報告", "分享診斷 Log", "清除舊診斷 Log")) { _, n -> when(n) {
+                                  0 -> shareGpsReport()
+                                  1 -> startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { type="text/plain"; putExtra(Intent.EXTRA_TEXT,TaiwanDashState.logs(this@TaiwanDashActivity)) },"分享 NaviPilot Log"))
+                                  2 -> AlertDialog.Builder(this).setTitle("清除診斷資料").setMessage("只刪除本 App 的診斷文字，不會刪除地圖或 C4 資料")
+                                      .setPositiveButton("刪除") { _, _ -> TaiwanDashState.clearLogs(this) }.setNegativeButton("取消",null).show()
+                              }}.show()
+                          3 -> openGoogleMaps()
+                          4 -> editCarrotAddress()
+                          5 -> showAdvancedOptions()
+                      }}.show()
+              }
+
+              private fun showAdvancedOptions() {
+          '''
+          once('    private fun showOptions() {', settings_menu, 'categorised settings')
+
+          # Show Google Maps Share prompt on first launch once the view hierarchy exists.
+          needle='''        createOverlayControls()
+                  // Always display current location in the foreground; monitoring is independently optional.'''
+          once(needle,'''        createOverlayControls()
+                  handler.post { if(!isFinishing && !isDestroyed) handleSharedIntent(intent) }
+                  // Always display current location in the foreground; monitoring is independently optional.''','onCreate share intent')
+
+          # make stop/monitoring state independent of historic Google navigation records.
+          s=s.replace('''        if (!fresh && running && TaiwanDashState.lastNavMs(this) != 0L && age > 5 * 60_000L && lastPosition?.speed?.let { it < 0.5f } == true) {''','''        if (!fresh && running && TaiwanDashState.lastNavMs(this) != 0L && age > 5 * 60_000L && lastPosition?.speed?.let { it < 0.5f } == true) {''')
+
+          # Add a visible map-action button beside the heading control; small screens keep compact size.
+          # JS must actually handle tap-to-pick; avoid relying on Android long-press timer.
+          html=Path('app/src/main/assets/tw_dashboard_map.html')
+          h=html.read_text(encoding='utf-8')
+          assert h.count('<div id="routeHint">長按地圖選目的地</div>')==1
+          h=h.replace('<div id="routeHint">長按地圖選目的地</div>', '<button type="button" id="pickBtn" onclick="setPickingMode(!picking)">📍 選目的地</button><div id="routeHint">按「選目的地」後點地圖</div>',1)
+          h=h.replace('''#routeHint{''','''#pickBtn{position:absolute;left:83px;top:8px;z-index:31;color:#fff;background:#1869cddd;border:1px solid #aac4e2;border-radius:6px;padding:5px 7px;font-size:12px}
+          #map.pick-mode{cursor:crosshair}#map.pick-mode #pickBtn{background:#147044}
+          #routeHint{''',1)
+          assert h.count('let holdTimer=null,holdX=0,holdY=0;')==1
+          h=h.replace('let holdTimer=null,holdX=0,holdY=0;', '''let holdTimer=null,holdX=0,holdY=0,picking=false;
+          function setPickingMode(active){
+           picking=!!active;
+           document.getElementById('map').classList.toggle('pick-mode',picking);
+           document.getElementById('pickBtn').textContent=picking?'✓ 點選地圖':'📍 選目的地';
+           document.getElementById('routeHint').textContent=picking?'請點一下地圖作為目的地':'按「選目的地」後點地圖';
+          }
+          function confirmPickedAt(x,y){
+           const c=coordsAt(x,y); if(!c)return;
+           setPickingMode(false);
+           try{TaiwanRoutePoint.selected(c[0],c[1]);}catch(e){document.getElementById('routeHint').textContent='無法呼叫 Android 選點';}
+          }
+          ''',1)
+          assert h.count('mapEl.addEventListener(\'contextmenu\',e=>e.preventDefault());')==1
+          h=h.replace("mapEl.addEventListener('contextmenu',e=>e.preventDefault());", '''mapEl.addEventListener('click', e=>{
+           if(!picking || e.target.closest('button'))return;
+           e.preventDefault();confirmPickedAt(e.clientX,e.clientY);
+          });
+          mapEl.addEventListener('contextmenu',e=>e.preventDefault());''',1)
+          # Existing long press remains available. When picking mode, longpress remains valid but does not double-submit.
+          h=h.replace("if(c)try{TaiwanRoutePoint.selected(c[0],c[1])}catch(e){};holdTimer=null;", "if(c){setPickingMode(false);try{TaiwanRoutePoint.selected(c[0],c[1])}catch(e){}};holdTimer=null;",1)
+          h=h.replace("'長按地圖選目的地';render();", "'按『選目的地』後點地圖';render();",1)
+          html.write_text(h,encoding='utf-8')
+
+          # New export target for Google Maps -> Share -> NaviPilot
+          manifest=Path('app/src/debug/AndroidManifest.xml')
+          ms=manifest.read_text(encoding='utf-8')
+          assert ms.count('<category android:name="android.intent.category.LAUNCHER" />')==1
+          ms=ms.replace('''                <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>''','''                <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>''',1)
+          assert ms.count('NaviPilot Taiwan 4.3')==1
+          ms=ms.replace('NaviPilot Taiwan 4.3','NaviPilot Taiwan 4.4',1)
+          manifest.write_text(ms,encoding='utf-8')
+
+          gradle=Path('app/build.gradle.kts')
+          g=gradle.read_text(encoding='utf-8')
+          assert g.count('versionName = "4.3.0-route-heading-preview"')==1
+          g=g.replace('versionName = "4.3.0-route-heading-preview"','versionName = "4.4.0-navigation-share-fix"',1)
+          g,n=re.subn(r'versionCode = (\d+)',lambda m:f'versionCode = {int(m.group(1))+1000000}',g,count=1)
+          assert n==1
+          assert 'applicationIdSuffix = ".taiwan"' in g
+          assert 'signingConfig = signingConfigs.getByName("release")' in g
+          gradle.write_text(g,encoding='utf-8')
+
+          src.write_text(s,encoding='utf-8')
+          print('v4.4 patch: monitoring fresh session, categorized menus, one-tap map picking, Google Maps share-target and destination parsing, stable package/signature')
+          PY_V44_PATCH
+          python3 -m py_compile /tmp/navipilot_patch_v44.py
+          python3 /tmp/navipilot_patch_v44.py
+          python3 - <<'PY_V44_CHECK'
+          from pathlib import Path
+          from xml.etree import ElementTree
+          import re
+          h=Path('app/src/main/assets/tw_dashboard_map.html').read_text(encoding='utf-8')
+          m=re.search(r'<script>([\s\S]+?)</script>',h)
+          assert m, 'Embedded map script missing'
+          Path('/tmp/navipilot_v44_map.js').write_text(m.group(1),encoding='utf-8')
+          ElementTree.parse('app/src/debug/AndroidManifest.xml')
+          src=Path('app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashActivity.kt').read_text(encoding='utf-8')
+          assert 'setPickingMode(true)' in src and 'handleSharedIntent' in src and 'showDisplayControls' in src
+          assert 'NaviPilot Taiwan 4.4' in Path('app/src/debug/AndroidManifest.xml').read_text()
+          PY_V44_CHECK
+          node --check /tmp/navipilot_v44_map.js
+
+      - name: Compile stable signed APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Verify stable install identity and signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)
+          test -n "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | grep -F "package: name='com.jixiexiaoge.drivingassist.taiwan'"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
+          echo 'Verified stable package ID and signed APK.'
+
+      - name: Upload signed NaviPilot v4.4 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NaviPilot-Taiwan-Dashboard-v44-signed
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
