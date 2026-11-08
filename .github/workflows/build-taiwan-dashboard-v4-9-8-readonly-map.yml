@@ -1,0 +1,1327 @@
+name: Build NaviPilot Taiwan Dashboard v4.9.8 (Read-only diagnostics + OpenFreeMap preview)
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    env:
+      TW_KEYSTORE_B64: ${{ secrets.NAVIPILOT_TW_KEYSTORE_B64 }}
+      TW_KEYSTORE_PASSWORD: ${{ secrets.NAVIPILOT_TW_PASSWORD }}
+    steps:
+    - name: Checkout NaviPilot source
+      uses: actions/checkout@v4
+    - name: Set up Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+    - name: Set up Android SDK
+      uses: android-actions/setup-android@v4
+      with:
+        packages: platform-tools
+    - name: Install Android toolchains
+      shell: bash
+      run: |
+        set -euo pipefail
+        sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;26.1.10909125' 'cmake;3.22.1'
+        yes | sdkmanager --licenses > /dev/null || true
+    - name: Set up Gradle
+      uses: gradle/actions/setup-gradle@v4
+    - name: Rebuild verified v4.9.2 source patches
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY_REPLAY_V492'
+        from pathlib import Path
+        import hashlib, os, subprocess
+        source=Path('.github/workflows/build-taiwan-dashboard-v4-9-2-carrot-vision-tpms.yml')
+        data=source.read_bytes()
+        expected='af81c0a927d6f02d06c0e42538663595d970d3bf'
+        sha=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\x00'+data).hexdigest()
+        if sha != expected:
+            raise SystemExit('The reviewed v4.9.2 workflow changed; refusing unreviewed source generator: '+sha)
+        steps=[]
+        current=None
+        collecting=False
+        lines=[]
+        def flush():
+            global current, collecting, lines
+            if current and collecting:
+                steps.append((current, '\n'.join(lines)+'\n'))
+            collecting=False
+            lines=[]
+        for line in data.decode('utf-8').splitlines():
+            if line.startswith('      - name: '):
+                flush()
+                current=line[len('      - name: '):].strip()
+            elif current and line=='        run: |':
+                collecting=True
+            elif collecting:
+                if line.startswith('          '):
+                    lines.append(line[10:])
+                elif not line.strip():
+                    lines.append('')
+                else:
+                    flush()
+        flush()
+        selected=[(name, script) for name,script in steps
+            if name.startswith('Recreate exact approved v4.1 base') or name.startswith('Add v4.') or name.startswith('Fix v4.9.1')]
+        if len(selected)!=11:
+            raise SystemExit('Expected 11 reviewed v4.1..v4.9.2 patch stages; got '+str([x[0] for x in selected]))
+        env=os.environ.copy()
+        if not env.get('TW_KEYSTORE_B64') or not env.get('TW_KEYSTORE_PASSWORD'):
+            raise SystemExit('Signing secrets are required to preserve existing install identity.')
+        for name, script in selected:
+            print('Executing approved stage:',name,flush=True)
+            subprocess.run(['bash','-e','-o','pipefail'],input=script,text=True,env=env,check=True)
+        PY_REPLAY_V492
+    - name: Apply v4.9.3 responsive dashboard and TPMS patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat > /tmp/np_carrot_ui_v493.js <<'NP_UI_493_JS'
+        (function () {
+          'use strict';
+          if (window.__npUi493Ready) return;
+          window.__npUi493Ready = true;
+          let overlay = null;
+          let popupTimer = null;
+          const style = document.createElement('style');
+          style.id = 'np-ui-v493';
+          style.textContent = [
+            'html.np-camera-fill #carrotStage video{object-fit:cover!important;width:100%!important;height:100%!important}',
+            'html.np-camera-fit #carrotStage video{object-fit:contain!important;width:100%!important;height:100%!important}',
+            '#np-tpms-overlay{position:fixed;inset:0;z-index:2147483640;background:rgba(0,10,17,.82);display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box;font-family:system-ui,sans-serif}',
+            '#np-tpms-overlay .np-card{width:min(94vw,620px);max-height:90dvh;overflow:auto;background:#102229;color:#f5ffff;border:1px solid #33a990;border-radius:20px;box-shadow:0 15px 55px #000a;padding:16px;box-sizing:border-box}',
+            '#np-tpms-overlay .np-title{display:flex;justify-content:space-between;align-items:center;font-weight:700;font-size:19px;margin-bottom:14px}',
+            '#np-tpms-overlay button{background:#176b63;border:0;color:white;border-radius:12px;min-width:62px;min-height:38px;font-size:15px}',
+            '#np-tpms-overlay .np-source{display:flex;align-items:center;justify-content:center;min-height:145px;overflow:hidden;background:#09191e;border-radius:14px;padding:18px}',
+            '#np-tpms-overlay .np-source .chud-tpms{display:block!important;visibility:visible!important;width:min(72vw,420px)!important;min-width:210px!important;max-width:none!important;height:auto!important;max-height:none!important;font-size:20px!important;transform:none!important}',
+            '#np-tpms-overlay .np-hint{font-size:12px;color:#92b5b6;margin-top:12px;line-height:1.5}'
+          ].join(';');
+          document.head.appendChild(style);
+
+          window.__npCameraFill = function (fill) {
+            const root = document.documentElement;
+            root.classList.toggle('np-camera-fill', !!fill);
+            root.classList.toggle('np-camera-fit', !fill);
+            const stage = document.getElementById('carrotStage');
+            if (!stage) return 'waiting-for-stage';
+            const videos = stage.querySelectorAll('video');
+            videos.forEach(function (v) {
+              v.style.setProperty('object-fit', fill ? 'cover' : 'contain', 'important');
+              v.style.setProperty('width', '100%', 'important');
+              v.style.setProperty('height', '100%', 'important');
+            });
+            return videos.length ? 'camera-fit-applied' : 'video-element-not-found';
+          };
+
+          function refreshTpms() {
+            if (!overlay) return;
+            const holder = overlay.querySelector('.np-source');
+            const source = document.querySelector('#carrotStage .chud-tpms');
+            if (!holder) return;
+            if (!source) {
+              holder.textContent = 'C4 尚未提供可顯示的胎壓資料';
+              return;
+            }
+            const clone = source.cloneNode(true);
+            clone.removeAttribute('id');
+            holder.replaceChildren(clone);
+          }
+          function closeTpms() {
+            if (popupTimer) clearInterval(popupTimer);
+            popupTimer = null;
+            if (overlay) overlay.remove();
+            overlay = null;
+          }
+          window.__npTpmsToggle = function () {
+            if (overlay) { closeTpms(); return 'closed'; }
+            overlay = document.createElement('div');
+            overlay.id = 'np-tpms-overlay';
+            overlay.innerHTML = '<div class="np-card"><div class="np-title"><span>TPMS 四輪胎壓</span><button type="button" id="np-tpms-close">關閉</button></div><div class="np-source">讀取 C4 胎壓中…</div><div class="np-hint">放大 Carrot Web 原始胎壓資訊，無資料不顯示模擬數值。此為觀測畫面，不作為行車控制依據。</div></div>';
+            overlay.querySelector('#np-tpms-close').addEventListener('click', closeTpms);
+            overlay.addEventListener('click', function (e) { if (e.target === overlay) closeTpms(); });
+            document.body.appendChild(overlay);
+            refreshTpms();
+            popupTimer = setInterval(refreshTpms, 1500);
+            return 'opened';
+          };
+        })();
+        NP_UI_493_JS
+        node --check /tmp/np_carrot_ui_v493.js
+        cat > /tmp/np_patch_v493.py <<'NP_PATCH_493_PY'
+        #!/usr/bin/env python3
+        """Apply the NaviPilot Taiwan v4.9.3 read-only UI update AFTER v4.9.2 steps."""
+        from pathlib import Path
+        import json
+        import re
+
+        root = Path('app/src/main/java/com/jixiexiaoge/drivingassist')
+        p = root / 'TaiwanDashActivity.kt'
+        s = p.read_text(encoding='utf-8')
+
+        def once(old, new, label):
+            global s
+            n = s.count(old)
+            if n != 1:
+                raise RuntimeError('v4.9.3 patch anchor %s: expected 1, got %s' % (label, n))
+            s = s.replace(old, new, 1)
+
+        # Teal dashboard colors, no vehicle or navigation commands.
+        for before, after in [
+            ('private val bg = Color.rgb(9, 17, 30)', 'private val bg = Color.rgb(8, 22, 29)'),
+            ('private val panelColor = Color.rgb(22, 35, 54)', 'private val panelColor = Color.rgb(17, 39, 46)'),
+            ('private val blue = Color.rgb(35, 121, 223)', 'private val blue = Color.rgb(0, 151, 130)'),
+        ]:
+            if before in s:
+                s = s.replace(before, after, 1)
+
+        # S/M/L change camera-panel size in both orientations. Retain the same WebViews.
+        weights = [
+            ('if (cameraLarge) 2.7f else 1.15f',
+             'when (layoutPrefs().getInt("np_video_size", 1)) { 0 -> 0.85f; 1 -> 1.45f; 2 -> 2.7f; else -> 5f }'),
+            ('if (cameraLarge) 0.70f else 0.46f',
+             'when (layoutPrefs().getInt("np_video_size", 1)) { 0 -> 0.30f; 1 -> 0.48f; 2 -> 0.70f; else -> 0.92f }'),
+            ('if (cameraLarge) 0.30f else 0.54f',
+             'when (layoutPrefs().getInt("np_video_size", 1)) { 0 -> 0.70f; 1 -> 0.52f; 2 -> 0.30f; else -> 0.08f }'),
+        ]
+        for old, new in weights:
+            once(old, new, 'responsive video weight ' + old)
+
+        # Compact two-line toolbar remains accessible in portrait and landscape.
+        needle = 'cameraPanel.addView(cameraStatus, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(26)))'
+        once(needle, needle + '\n                npInstallCameraControls()', 'camera controls after original status')
+
+        html = '''<!doctype html><html lang="zh-Hant"><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+        html,body{margin:0;background:#08161d;color:#eafffa;font-family:system-ui,sans-serif;height:100%;overflow:hidden}
+        .stage{height:100%;display:flex;flex-direction:column}.label{padding:13px 16px 4px;color:#57e3c3;font-weight:700;font-size:14px}
+        svg{width:100%;flex:1;min-height:190px;display:block}.warning{padding:8px 14px 15px;font-size:12px;color:#a7c9c6;line-height:1.4}
+        </style></head><body><div class="stage"><div class="label">TURZX 風格 · 多車道 3D 示意</div>
+        <svg viewBox="0 0 660 310" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">
+        <defs><linearGradient id="r" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#294653"/><stop offset="1" stop-color="#10232c"/></linearGradient><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#1b9479" stop-opacity=".14"/><stop offset="1" stop-color="#41ffb5" stop-opacity=".55"/></linearGradient></defs>
+        <path d="M230 23 L430 23 L655 310 L5 310Z" fill="url(#r)"/><path d="M300 23 L360 23 L437 310 L223 310Z" fill="url(#g)"/>
+        <g stroke="#b3e6e0" stroke-width="3" opacity=".9"><path d="M278 23 L154 310" stroke-dasharray="14 13"/><path d="M382 23 L506 310" stroke-dasharray="14 13"/></g>
+        <path d="M230 23 L5 310 M430 23 L655 310" stroke="#47be9e" stroke-width="5" opacity=".65"/>
+        <g fill="#4c8185" stroke="#abffff" stroke-width="2"><path d="M309 205 L351 205 L366 270 L294 270Z"/><path d="M320 164 L339 164 L348 206 L311 206Z"/></g>
+        <g stroke="#8dfacb" stroke-width="2" opacity=".7"><path d="M323 185 Q330 135 330 40" stroke-dasharray="9 7"/></g>
+        <text x="26" y="30" fill="#58ebc1" font-size="15">3D VIEW / PREVIEW</text><text x="26" y="54" fill="#b0c6c9" font-size="12">非即時道路模型</text>
+        </svg><div class="warning">這是畫面配置示意，尚未串接 C4 的 modelV2 車道位置、前車與校正參數；不可當作可變換車道或避障的依據。</div></div></body></html>'''
+
+        methods = '''    // v4.9.3: read-only portrait/landscape camera controls and TPMS popup.
+            private fun npInstallCameraControls() {
+                val sizes = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                listOf("S", "M", "L", "全螢幕").forEachIndexed { index, label ->
+                    sizes.addView(button(label, if (index == 2) blue else panelColor) { npSetCameraSize(index) },
+                        LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                }
+                cameraPanel.addView(sizes, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(38)))
+                val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                actions.addView(button("完整 Fit") { npSetCameraFill(false) }, LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                actions.addView(button("填滿 Fill", blue) { npSetCameraFill(true) }, LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                actions.addView(button("TPMS 放大") { npShowTpms() }, LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                actions.addView(button("3D 預覽") { npShow3dPreview() }, LinearLayout.LayoutParams(0, dp(34), 1f))
+                cameraPanel.addView(actions, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(38)))
+            }
+
+            private fun npSetCameraSize(size: Int) {
+                layoutPrefs().edit().putInt("np_video_size", size).apply()
+                chooseDisplayMode(if (size == 3) 3 else if (size == 2) 2 else 1)
+            }
+
+            private fun npSetCameraFill(fill: Boolean) {
+                layoutPrefs().edit().putBoolean("np_camera_fill", fill).apply()
+                if (::carrot.isInitialized && cameraLive && isSameCarrot(carrot.url.orEmpty())) {
+                    carrot.evaluateJavascript("window.__npCameraFill && window.__npCameraFill(" + fill.toString() + ");", null)
+                }
+                Toast.makeText(this, if (fill) "已選填滿（可能裁切畫面邊緣）" else "已選完整顯示（可能保留黑邊）", Toast.LENGTH_SHORT).show()
+            }
+
+            private fun npShowTpms() {
+                if (!cameraLive || !::carrot.isInitialized || !isSameCarrot(carrot.url.orEmpty())) {
+                    Toast.makeText(this, "請先連接 C4 Carrot Web", Toast.LENGTH_SHORT).show()
+                    return
+                }
+                carrot.evaluateJavascript("window.__npTpmsToggle && window.__npTpmsToggle();", null)
+            }
+
+            private fun npShow3dPreview() {
+                val preview = WebView(this).apply {
+                    settings.javaScriptEnabled = false
+                    setBackgroundColor(Color.rgb(8, 22, 29))
+                    loadDataWithBaseURL(null, ''' + json.dumps(html, ensure_ascii=False) + ''', "text/html", "UTF-8", null)
+                }
+                AlertDialog.Builder(this).setTitle("多車道 3D HUD（示意）").setView(preview)
+                    .setPositiveButton("關閉", null).show()
+            }
+
+        '''
+        once('    private fun connectCarrot() {', methods + '    private fun connectCarrot() {', 'v493 UI helpers')
+
+        # JS is sourced from a pinned asset saved in the workflow's temporary workspace.
+        js = Path('/tmp/np_carrot_ui_v493.js').read_text(encoding='utf-8')
+        if '$' in js:
+            raise RuntimeError('Javascript should not include Kotlin interpolation dollar signs')
+        js_literal = json.dumps(js, ensure_ascii=False)
+        old = 'carrot.evaluateJavascript(script + ";window.__npSetCarrotVisionOnly(" + carrotVisionOnlyEnabled().toString() + ");", null)'
+        new = ('val npScript = ' + js_literal + '\n'
+               '                  carrot.evaluateJavascript(script + ";window.__npSetCarrotVisionOnly(" + '
+               'carrotVisionOnlyEnabled().toString() + ");" + npScript + '
+               '";window.__npCameraFill(" + layoutPrefs().getBoolean("np_camera_fill", true).toString() + ");", null)')
+        once(old, new, 'Carrot Web pure stage plus Fit/Fill and TPMS JS')
+        p.write_text(s, encoding='utf-8')
+
+        build = Path('app/build.gradle.kts')
+        g = build.read_text(encoding='utf-8')
+        assert g.count('versionName = "4.9.2-carrot-vision-only"') == 1
+        assert 'applicationIdSuffix = ".taiwan"' in g
+        assert 'signingConfig = signingConfigs.getByName("release")' in g
+        g = g.replace('versionName = "4.9.2-carrot-vision-only"', 'versionName = "4.9.3-responsive-tpms-3d-preview"', 1)
+        g, n = re.subn(r'versionCode = (\d+)', lambda m: 'versionCode = ' + str(int(m.group(1)) + 1000000), g, count=1)
+        assert n == 1
+        build.write_text(g, encoding='utf-8')
+
+        manifest = Path('app/src/debug/AndroidManifest.xml')
+        m = manifest.read_text(encoding='utf-8')
+        assert m.count('NaviPilot Taiwan 4.9.2') == 1
+        manifest.write_text(m.replace('NaviPilot Taiwan 4.9.2', 'NaviPilot Taiwan 4.9.3', 1), encoding='utf-8')
+        print('v4.9.3: responsive S/M/L/Full camera, Fit/Fill toggle, independent TPMS popup, 3D demo only')
+        NP_PATCH_493_PY
+        python3 -m py_compile /tmp/np_patch_v493.py
+        python3 /tmp/np_patch_v493.py
+    - name: Compact v4.9.4 camera controls (hide controls by default)
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat > /tmp/np_patch_v494.py <<'NP_PATCH_494_PY'
+        #!/usr/bin/env python3
+        # NaviPilot Taiwan v4.9.4: collapse camera buttons
+        from pathlib import Path
+        import re
+        p=Path('app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashActivity.kt')
+        s=p.read_text(encoding='utf-8')
+        # Keep existing network, car-side stream, navigation, and TPMS code unchanged.
+        pattern=r'    private fun npInstallCameraControls\(\) \{[\s\S]*?\n    \}\n\n    private fun npSetCameraSize\(size: Int\) \{'
+        replacement='''    private lateinit var npCameraOptionDeck: LinearLayout
+
+            private fun npInstallCameraControls() {
+                // Compact access in the existing camera header, never across the live camera.
+                val header = cameraPanel.getChildAt(0) as? LinearLayout
+                header?.addView(button("選項") { npToggleCameraOptions() },
+                    LinearLayout.LayoutParams(dp(58), dp(38)))
+                npCameraOptionDeck = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    visibility = View.GONE
+                }
+                val sizes = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                }
+                listOf("S", "M", "L", "全螢幕").forEachIndexed { index, label ->
+                    val selected = layoutPrefs().getInt("np_video_size", 2) == index
+                    sizes.addView(button(label, if (selected) blue else panelColor) { npSetCameraSize(index) },
+                        LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                }
+                npCameraOptionDeck.addView(sizes,
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(38)))
+                val actions = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                }
+                actions.addView(button("完整 Fit") { npSetCameraFill(false); npHideCameraOptions() },
+                    LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                actions.addView(button("填滿 Fill") { npSetCameraFill(true); npHideCameraOptions() },
+                    LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                actions.addView(button("TPMS 放大") { npHideCameraOptions(); npShowTpms() },
+                    LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                actions.addView(button("3D 示意") { npHideCameraOptions(); npShow3dPreview() },
+                    LinearLayout.LayoutParams(0, dp(34), 1f))
+                npCameraOptionDeck.addView(actions,
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(38)))
+                cameraPanel.addView(npCameraOptionDeck,
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT))
+            }
+
+            private fun npToggleCameraOptions() {
+                if (!::npCameraOptionDeck.isInitialized) return
+                npCameraOptionDeck.visibility = if (npCameraOptionDeck.visibility == View.VISIBLE)
+                    View.GONE else View.VISIBLE
+            }
+
+            private fun npHideCameraOptions() {
+                if (::npCameraOptionDeck.isInitialized) npCameraOptionDeck.visibility = View.GONE
+            }
+
+            private fun npSetCameraSize(size: Int) {'''
+        s,n=re.subn(pattern,lambda _:replacement,s,count=1)
+        assert n==1, f'Missing v4.9.3 camera toolbar method ({n})'
+        # Close the expanded controls after a user chooses any size.
+        old='''    private fun npSetCameraSize(size: Int) {
+                          layoutPrefs().edit().putInt("np_video_size", size).apply()'''
+        # Indentation generated from v4.9.3 patch can vary; locate statement instead of rewriting logic.
+        m=re.search(r'(private fun npSetCameraSize\(size: Int\) \{\s*)(layoutPrefs\(\)\.edit\(\)\.putInt\("np_video_size", size\)\.apply\(\))',s)
+        assert m, 'Missing v4.9.3 video size setter'
+        s=s[:m.start(2)]+'npHideCameraOptions()\n        '+s[m.start(2):]
+        p.write_text(s,encoding='utf-8')
+
+        b=Path('app/build.gradle.kts');g=b.read_text(encoding='utf-8')
+        assert g.count('versionName = "4.9.3-responsive-tpms-3d-preview"') == 1
+        g=g.replace('versionName = "4.9.3-responsive-tpms-3d-preview"','versionName = "4.9.4-compact-camera-toolbar"',1)
+        g,n=re.subn(r'versionCode = (\d+)',lambda m:'versionCode = '+str(int(m.group(1))+1000000),g,count=1)
+        assert n==1
+        b.write_text(g,encoding='utf-8')
+        m=Path('app/src/debug/AndroidManifest.xml');v=m.read_text(encoding='utf-8')
+        assert v.count('NaviPilot Taiwan 4.9.3') == 1
+        m.write_text(v.replace('NaviPilot Taiwan 4.9.3','NaviPilot Taiwan 4.9.4',1),encoding='utf-8')
+        print('v4.9.4: collapsible camera controls; original TPMS & navigation retained')
+        NP_PATCH_494_PY
+        python3 -m py_compile /tmp/np_patch_v494.py
+        python3 /tmp/np_patch_v494.py
+    - name: Apply v4.9.5 safe Fit, auto-open TPMS, live lane view and explicit exit
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat > /tmp/np_v495_live.js <<'NP_495_JS'
+        (function () {
+          'use strict';
+          if (window.__npV495Installed) return;
+          window.__npV495Installed = true;
+          let active3D = null;
+          let live3DTimer = null;
+          let lastModel = null;
+          let lastModelTime = 0;
+          const css = document.createElement('style');
+          css.id = 'np-v495-live-ui';
+          css.textContent = [
+            '#np-live3d{position:fixed!important;inset:0!important;width:100%!important;height:100%!important;z-index:2147483639!important;background:#071a20!important;color:#e9fffa!important;font-family:system-ui,sans-serif!important;display:flex!important;flex-direction:column!important;box-sizing:border-box!important;}',
+            '#np-live3d header{display:flex!important;align-items:center!important;justify-content:space-between!important;gap:8px!important;padding:10px 14px!important;min-height:44px!important;background:#0b2930!important;flex:0 0 auto!important;}',
+            '#np-live3d header strong{font-size:16px!important;color:#6af3c5!important;}',
+            '#np-live3d header button{background:#177868!important;border:0!important;color:white!important;border-radius:10px!important;padding:10px 16px!important;min-height:36px!important;cursor:pointer!important;}',
+            '#np-live3d canvas{display:block!important;flex:1 1 auto!important;min-height:100px!important;width:100%!important;background:#071720!important;}',
+            '#np-live3d footer{padding:8px 13px!important;background:#0b2229!important;font-size:12px!important;color:#adccc9!important;flex:0 0 auto!important;line-height:1.45!important;}'
+          ].join('');
+          document.head.appendChild(css);
+
+          window.__npCameraSafeFit = function () {
+            // Restore upstream Carrot's video rules: especially do not expand its
+            // hidden 1px shared RTC video element into the visible camera stage.
+            const root = document.documentElement;
+            root.classList.remove('np-camera-fill', 'np-camera-fit');
+            const stage = document.getElementById('carrotStage');
+            if (stage) stage.querySelectorAll('video').forEach(function (v) {
+              v.style.removeProperty('object-fit');
+              v.style.removeProperty('width');
+              v.style.removeProperty('height');
+            });
+            return 'native-fit-restored';
+          };
+
+          window.__npAutoOpenTpms = function () {
+            // One display per page session; after a manual close, do not reopen on refresh.
+            if (window.__npTpmsAutoOpened) return 'already-opened-this-page';
+            if (typeof window.__npTpmsToggle !== 'function') return 'tpms-code-not-ready';
+            window.__npTpmsAutoOpened = true;
+            if (!document.getElementById('np-tpms-overlay')) window.__npTpmsToggle();
+            return 'tpms-opened';
+          };
+
+          function number(x) { const n = Number(x); return Number.isFinite(n) ? n : null; }
+          function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+          function project(ctx, width, height, d, y) {
+            const dist = clamp(d, 0, 120);
+            const depth = 15 / (dist + 15);
+            return [width * .5 - (y / 3.5) * width * .235 * depth,
+                    height * .87 - (1 - depth) * height * .72];
+          }
+          function drawPoly(ctx, points, color, lineWidth, alpha) {
+            if (points.length < 2) return;
+            ctx.beginPath();
+            ctx.moveTo(points[0][0], points[0][1]);
+            for (let i = 1; i < points.length; i++) ctx.lineTo(points[i][0], points[i][1]);
+            ctx.globalAlpha = alpha;
+            ctx.strokeStyle = color;
+            ctx.lineWidth = lineWidth;
+            ctx.stroke();
+            ctx.globalAlpha = 1;
+          }
+          function lanePoints(item, w, h) {
+            const xs = item && item.x;
+            const ys = item && item.y;
+            if (!Array.isArray(xs) || !Array.isArray(ys)) return [];
+            const out = [];
+            for (let i = 0; i < Math.min(xs.length, ys.length); i += 1) {
+              const x = number(xs[i]);
+              const y = number(ys[i]);
+              if (x === null || y === null || x < 0 || x > 120 || Math.abs(y) > 22) continue;
+              out.push(project(null, w, h, x, y));
+            }
+            return out.sort(function(a,b){ return b[1]-a[1]; });
+          }
+          function car(ctx, w, h, d, lateral, color, label) {
+            const p = project(ctx,w,h,d,lateral);
+            const scale = clamp(14 / (d + 12), .2, 1.1);
+            const cw = 36 * scale;
+            const ch = 64 * scale;
+            ctx.fillStyle = 'rgba(0,0,0,.6)';
+            ctx.fillRect(p[0] - cw*.60, p[1] - ch*.25, cw*1.2, ch*.75);
+            ctx.fillStyle = color;
+            ctx.fillRect(p[0] - cw/2, p[1]-ch, cw, ch);
+            ctx.fillStyle = '#092c35';
+            ctx.fillRect(p[0]-cw*.34, p[1]-ch*.74, cw*.68, ch*.24);
+            ctx.fillStyle = '#f3fffb';
+            ctx.font = Math.max(10,12 * scale) + 'px system-ui';
+            ctx.textAlign = 'center';
+            ctx.fillText(label,p[0],p[1]-ch-4);
+          }
+          function radarTracks(radar) {
+            if (!radar || typeof radar !== 'object') return [];
+            const arr = [];
+            const groups = ['leadsLeft','leadsCenter','leadsRight'];
+            for (const key of groups) {
+              if (!Array.isArray(radar[key])) continue;
+              for (const track of radar[key]) {
+                // Do not invent lane offsets: require a real lateral coordinate.
+                const dist = number(track && track.dRel);
+                const lat = number(track && track.yRel);
+                if (dist === null || lat === null || dist < 0 || dist > 110 || Math.abs(lat) > 13 || track.status === false) continue;
+                arr.push({dist:dist,lat:lat,group:key});
+              }
+            }
+            if (!arr.length) {
+              for (const key of ['leadOne','leadTwo']) {
+                const track = radar[key];
+                const dist = number(track && track.dRel);
+                const lat = number(track && track.yRel);
+                if (!track || !track.status || dist === null || lat === null || dist < 0 || dist > 110) continue;
+                arr.push({dist:dist,lat:lat,group:'forward'});
+              }
+            }
+            return arr;
+          }
+          function render3D() {
+            if (!active3D) return;
+            const canvas = active3D.querySelector('canvas');
+            const ctx = canvas.getContext('2d');
+            const box = canvas.getBoundingClientRect();
+            const w = Math.max(160, Math.round(box.width));
+            const h = Math.max(130, Math.round(box.height));
+            if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+            const gradient = ctx.createLinearGradient(0,0,0,h);
+            gradient.addColorStop(0,'#071d2a');gradient.addColorStop(1,'#122b31');
+            ctx.fillStyle=gradient;ctx.fillRect(0,0,w,h);
+            const state = window.CarrotOverlayState || {};
+            const model = state.modelV2;
+            const radar = state.radarState;
+            const laneLines = Array.isArray(model && model.laneLines) ? model.laneLines : [];
+            if (model && model !== lastModel) { lastModel = model; lastModelTime = Date.now(); }
+            const fresh = !!lastModel && Date.now() - lastModelTime <= 5000;
+            const footer = active3D.querySelector('footer');
+            if (fresh && laneLines.length) {
+              // Only the model's real lane lines are drawn; no synthetic side lanes.
+              const pts = laneLines.map(function(l){ return lanePoints(l,w,h); });
+              if (pts.length >= 3 && pts[1].length > 1 && pts[2].length > 1) {
+                const road = pts[1].slice().concat(pts[2].slice().reverse());
+                ctx.fillStyle = 'rgba(23,91,85,.19)';
+                ctx.beginPath();ctx.moveTo(road[0][0],road[0][1]);
+                road.slice(1).forEach(function(q){ctx.lineTo(q[0],q[1]);});
+                ctx.closePath();ctx.fill();
+              }
+              pts.forEach(function(p,i){drawPoly(ctx,p,i===1||i===2?'#68edba':'#779ba9',i===1||i===2?3:2,(i===1||i===2)?.92:.5);});
+              const tracks=radarTracks(radar);
+              for (const t of tracks) car(ctx,w,h,t.dist,t.lat,'#65b6e1',Math.round(t.dist)+'m');
+              const anySide = tracks.some(function(t){return t.group==='leadsLeft'||t.group==='leadsRight';});
+              footer.textContent = '真實 C4 modelV2：'+laneLines.length+' 條模型線｜車輛：'+tracks.length+' 筆'+(anySide?'（含側車資料）':'（未確認側車資料）')+'。僅供顯示，不能用來判斷換道或避障。';
+            } else {
+              ctx.fillStyle='#abd7d2';ctx.font='16px system-ui';ctx.textAlign='center';
+              ctx.fillText('等待 C4 modelV2 即時車道資料',w/2,h*.42);
+              ctx.font='12px system-ui';
+              ctx.fillText('未收到資料時不會生成虛構車道或旁車',w/2,h*.49);
+              footer.textContent = '目前沒有新鮮的 3D 車道模型。請確認 C4 與 Carrot Web 的模型資料流可用。';
+            }
+            // Fixed own-car icon is an orientation marker, not a detected nearby vehicle.
+            car(ctx,w,h,0,0,'#2dd2a5','自車');
+            ctx.font='12px system-ui';ctx.textAlign='left';ctx.fillStyle='#65debb';
+            ctx.fillText('C4 LIVE 3D • 僅限資料可用時繪製',10,22);
+          }
+          function closeLive3D() {
+            if (live3DTimer) window.clearInterval(live3DTimer);
+            live3DTimer = null;
+            if (active3D) active3D.remove();
+            active3D = null;
+            lastModel = null;
+            lastModelTime = 0;
+          }
+          window.__npShowLive3D = function () {
+            if (active3D) {closeLive3D();return 'closed';}
+            // Close TPMS before showing the scene to avoid stacked full-screen overlays.
+            const tpms = document.getElementById('np-tpms-overlay');
+            if (tpms && typeof window.__npTpmsToggle === 'function') window.__npTpmsToggle();
+            // Request read-only overlay telemetry while the 3D viewer is active.
+            // This subscribes to modelV2/radarState; it does not send car controls.
+            try { window.CarrotVisionRaw?.connectOverlay?.(); } catch (_ignored) {}
+            const box=document.createElement('div');box.id='np-live3d';
+            const header=document.createElement('header');
+            const title=document.createElement('strong');title.textContent='NaviPilot · 3D 車道';
+            const close=document.createElement('button');close.textContent='返回影像';close.addEventListener('click',closeLive3D);
+            header.append(title,close);box.appendChild(header);
+            const canvas=document.createElement('canvas');canvas.setAttribute('aria-label','Live C4 lane model');box.appendChild(canvas);
+            const footer=document.createElement('footer');footer.textContent='等待 C4 車道模型；無資料不會虛構車道。';box.appendChild(footer);
+            document.body.appendChild(box);active3D=box;
+            render3D();live3DTimer=window.setInterval(render3D,300);
+            return 'opened';
+          };
+        })();
+        NP_495_JS
+        node --check /tmp/np_v495_live.js
+        cat > /tmp/np_patch_v495.py <<'NP_495_PY'
+        #!/usr/bin/env python3
+        """V4.9.5: reliable quit, boot TPMS, model-based 2.5D lane visualization."""
+        from pathlib import Path
+        import json, re
+
+        p = Path('app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashActivity.kt')
+        s = p.read_text(encoding='utf-8')
+        def once(old, new, label):
+            global s
+            n = s.count(old)
+            if n != 1:
+                raise RuntimeError(f'v4.9.5 {label}: expected one anchor, found {n}')
+            s = s.replace(old, new, 1)
+
+        # In the 4.9.4 compact menu, make the unstable Fill path unavailable.
+        old = 'button("填滿 Fill") { npSetCameraFill(true); npHideCameraOptions() }'
+        new = 'button("Fill 暫停") { Toast.makeText(this, "Fill 仍有 HUD 對位問題，請使用正常的 Fit", Toast.LENGTH_LONG).show(); npHideCameraOptions() }'
+        once(old, new, 'temporarily disable misaligned Fill')
+
+        # Make Fit the default for existing installs too, not only fresh preferences.
+        old = '''              private fun npSetCameraFill(fill: Boolean) {
+                          layoutPrefs().edit().putBoolean("np_camera_fill", fill).apply()'''
+        # Be tolerant of patch-generated function indentation.
+        pattern = r'(private fun npSetCameraFill\(fill: Boolean\) \{\s*)(layoutPrefs\(\)\.edit\(\)\.putBoolean\("np_camera_fill", fill\)\.apply\(\))'
+        matches = list(re.finditer(pattern, s))
+        if len(matches) != 1: raise RuntimeError(f'v4.9.5 Fit method: expected one, found {len(matches)}')
+        start, end = matches[0].span(2)
+        s = s[:start] + '''if (fill) {
+                              Toast.makeText(this, "Fill 暫時停用，避免影像與 HUD 錯位", Toast.LENGTH_LONG).show()
+                              return
+                          }
+                          ''' + s[start:]
+
+        # Rename the button to describe the new real-data viewer, not a static preview.
+        once('button("3D 示意")', 'button("3D 即時")', '3D action label')
+
+        # Restore Carrot's original Fit behavior, not v493's blanket video resize.
+        once('carrot.evaluateJavascript("window.__npCameraFill && window.__npCameraFill(" + fill.toString() + ");", null)',
+             'carrot.evaluateJavascript("window.__npCameraSafeFit && window.__npCameraSafeFit();", null)',
+             'use native Carrot FIT without shared-video enlargement')
+
+        # Add safe exit to the existing top-level drawer, preserving existing indices.
+        needle = '"⚙ 權限與診斷"'
+        once(needle, needle + ',\n                       "⏻ 退出 NaviPilot（停止監測）"', 'quit menu entry')
+        needle = '4 -> showOptions()'
+        once(needle, needle + '\n                           5 -> npConfirmExit()', 'quit handler')
+
+        # Auto connect to C4 on normal icon launch only, not on cold Google Maps shares.
+        # Match the real Kotlin invocation regardless of indentation in the generated file.
+        pattern = r'(?m)^([ \t]*)loadCameras\(\)[ \t]*$'
+        matches = list(re.finditer(pattern, s))
+        if len(matches) != 1:
+            raise RuntimeError(
+                'v4.9.5.1 auto-connect C4: expected one onCreate loadCameras() call; '
+                f'found {len(matches)}. Inspect source before retrying.'
+            )
+        match = matches[0]
+        indent = match.group(1)
+        extra = [
+            'if (!layoutPrefs().getBoolean("np_v495_fit_initialized", false)) {',
+            '    layoutPrefs().edit().putBoolean("np_camera_fill", false)',
+            '        .putBoolean("np_v495_fit_initialized", true).apply()',
+            '}',
+            'if (intent?.action == Intent.ACTION_MAIN && savedInstanceState == null) {',
+            '    handler.postDelayed({',
+            '        if (!isFinishing && !isDestroyed && !cameraLive) connectCarrot()',
+            '    }, 900L)',
+            '}',
+        ]
+        insert = '\n' + '\n'.join(indent + line for line in extra)
+        s = s[:match.end()] + insert + s[match.end():]
+
+        # Replace static 3D SVG dialog with live model-dependent canvas rendered inside Carrot Web.
+        pattern = r'(?m)^\s*private fun npShow3dPreview\(\) \{[\s\S]*?(?=^\s*private fun connectCarrot\(\) \{)'
+        replacement = '''
+            private fun npShow3dPreview() {
+                if (!cameraLive || !::carrot.isInitialized || !isSameCarrot(carrot.url.orEmpty())) {
+                    Toast.makeText(this, "請先連接 C4，才能讀取即時車道模型", Toast.LENGTH_LONG).show()
+                    return
+                }
+                carrot.evaluateJavascript("window.__npShowLive3D && window.__npShowLive3D();", null)
+            }
+
+            private fun npConfirmExit() {
+                AlertDialog.Builder(this)
+                    .setTitle("退出 NaviPilot？")
+                    .setMessage("會停止 NaviPilot 監測、GPS 和 C4 畫面連線，再關閉程式。comma 4 本身仍正常運作。")
+                    .setPositiveButton("停止並退出") { _, _ ->
+                        stopEverything("manual_exit")
+                        handler.removeCallbacksAndMessages(null)
+                        finishAndRemoveTask()
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            }
+
+        '''
+        s, count = re.subn(pattern,lambda m:replacement,s,count=1)
+        if count != 1: raise RuntimeError('v4.9.5 could not locate prior 3D preview function')
+
+        # Maintain existing JS installation and append a separate v495 overlay script.
+        js = Path('/tmp/np_v495_live.js').read_text(encoding='utf-8')
+        if '$' in js: raise RuntimeError('Avoid Kotlin dollar interpolation in JS literal')
+        js_literal = json.dumps(js, ensure_ascii=False)
+        needle = 'carrot.evaluateJavascript(script + ";window.__npSetCarrotVisionOnly(" + carrotVisionOnlyEnabled().toString() + ");" + npScript + ";window.__npCameraFill(" + layoutPrefs().getBoolean("np_camera_fill", true).toString() + ");", null)'
+        replace = '''val npV495 = ''' + js_literal + '''
+                          carrot.evaluateJavascript(script + ";window.__npSetCarrotVisionOnly(" + carrotVisionOnlyEnabled().toString() + ");" + npScript + ";" + npV495 + ";window.__npCameraSafeFit();window.__npAutoOpenTpms&&window.__npAutoOpenTpms();", null)'''
+        once(needle,replace,'append live-model overlay and auto popup')
+
+        # Preserve application ID, existing signing config, and other app flows.
+        b = Path('app/build.gradle.kts')
+        g = b.read_text(encoding='utf-8')
+        assert g.count('versionName = "4.9.4-compact-camera-toolbar"') == 1
+        assert 'applicationIdSuffix = ".taiwan"' in g
+        assert 'signingConfig = signingConfigs.getByName("release")' in g
+        g = g.replace('versionName = "4.9.4-compact-camera-toolbar"', 'versionName = "4.9.5.1-live-lane-tpms-exit"', 1)
+        g, count = re.subn(r'versionCode = (\d+)',lambda m:'versionCode = '+str(int(m.group(1))+1000000),g,count=1)
+        assert count == 1
+        b.write_text(g,encoding='utf-8')
+        manifest = Path('app/src/debug/AndroidManifest.xml')
+        m = manifest.read_text(encoding='utf-8')
+        assert m.count('NaviPilot Taiwan 4.9.4') == 1
+        manifest.write_text(m.replace('NaviPilot Taiwan 4.9.4','NaviPilot Taiwan 4.9.5.1',1),encoding='utf-8')
+        p.write_text(s,encoding='utf-8')
+        print('v4.9.5.1: quit, boot TPMS, Fit-only safe mode and live C4 modelV2 lane viewer')
+        NP_495_PY
+        python3 -m py_compile /tmp/np_patch_v495.py
+        python3 /tmp/np_patch_v495.py
+        grep -q 'versionName = "4.9.5.1-live-lane-tpms-exit"' app/build.gradle.kts
+        grep -q 'npConfirmExit' app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashActivity.kt
+        grep -q '__npShowLive3D' app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashActivity.kt
+    - name: Apply v4.9.6 interactive buttons and adjustable camera-map ratio
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat > /tmp/np_patch_v496.py <<'NP_496_PY'
+        #!/usr/bin/env python3
+        # v4.9.6: synchronized selected camera options and adjustable camera/map split.
+        # No CAN / car-control writes. Works with or without a connected C4.
+        from pathlib import Path
+        import re
+
+        p=Path('app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashActivity.kt')
+        s=p.read_text(encoding='utf-8')
+
+        def replace_unique(old,new,label):
+            global s
+            n=s.count(old)
+            if n != 1:
+                raise RuntimeError(f'v4.9.6 {label}: expected one anchor, got {n}')
+            s=s.replace(old,new,1)
+
+        def change_block(start_sig,end_sig,updated,label):
+            global s
+            beginnings=list(re.finditer(re.escape(start_sig),s))
+            if len(beginnings)!=1:
+                raise RuntimeError(f'v4.9.6 {label}: expected one method, found {len(beginnings)}')
+            m=beginnings[0]
+            # Functions in generated source are class-level, whitespace indentation is not significant.
+            start=s.rfind('\n',0,m.start())+1
+            end=s.find(end_sig,m.end())
+            if end<0:raise RuntimeError(f'v4.9.6 {label}: cannot find end method')
+            # Drop old method(s) through the previous line break.
+            end=s.rfind('\n',0,end)+1
+            s=s[:start]+updated+'\n'+s[end:]
+
+        # Only the widget code is replaced; it never re-creates either Carrot or map WebView.
+        controls='''    private lateinit var npOptionToggleButton: Button
+            private lateinit var npRatioButton: Button
+            private lateinit var npFitButton: Button
+            private lateinit var npCameraSplitInfo: TextView
+            private val npSizeButtons = mutableListOf<Button>()
+
+            private fun npSplitPercent(): Int {
+                val prefs = layoutPrefs()
+                if (prefs.getBoolean("np_split_custom_enabled", false))
+                    return prefs.getInt("np_split_custom", 73).coerceIn(30, 85)
+                return when (prefs.getInt("mode", 1)) {
+                    2 -> 73 // The original Carrot-large mode must really be 73%.
+                    3 -> 95 // Full screen uses focused layout; the map is absent.
+                    else -> if (prefs.getInt("np_video_size", 1) == 0) 42 else 59
+                }
+            }
+
+            private fun npCameraLandscapeWeight(): Float {
+                val ratio = npSplitPercent().toFloat()
+                return ratio / (100f - ratio)
+            }
+
+            private fun npPaintButton(button: Button, selected: Boolean) {
+                button.isSelected = selected
+                button.background = shape(if (selected) blue else panelColor, 11)
+                button.alpha = if (selected) 1f else 0.83f
+            }
+
+            private fun npSyncCameraOptions() {
+                if (!::npCameraOptionDeck.isInitialized || !::npOptionToggleButton.isInitialized) return
+                val open = npCameraOptionDeck.visibility == View.VISIBLE
+                npOptionToggleButton.text = if (open) "收合 ▲" else "選項 ▼"
+                npPaintButton(npOptionToggleButton, open)
+                val mode = layoutPrefs().getInt("mode", 1)
+                val custom = layoutPrefs().getBoolean("np_split_custom_enabled", false) && mode != 3
+                val size = when (mode) {
+                    2 -> 2
+                    3 -> 3
+                    else -> if (layoutPrefs().getInt("np_video_size", 1) == 0) 0 else 1
+                }
+                npSizeButtons.forEachIndexed { index, button -> npPaintButton(button, !custom && index == size) }
+                npRatioButton.text = if (custom) "自訂 ${npSplitPercent()}% ✓" else "調整比例"
+                npPaintButton(npRatioButton, custom)
+                npPaintButton(npFitButton, true)
+                npCameraSplitInfo.text = if (mode == 3) "Carrot 全螢幕 · 地圖隱藏" else
+                    "Carrot 影像 ${npSplitPercent()}%   /   地圖 ${100 - npSplitPercent()}%"
+            }
+
+            private fun npInstallCameraControls() {
+                // Keep the options collapsed over the picture, including in landscape.
+                val header = cameraPanel.getChildAt(0) as? LinearLayout
+                npOptionToggleButton = button("選項 ▼") { npToggleCameraOptions() }
+                npOptionToggleButton.textSize = 11f
+                header?.addView(npOptionToggleButton, LinearLayout.LayoutParams(dp(64), dp(38)))
+                npCameraOptionDeck = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    visibility = View.GONE
+                    setPadding(dp(3), dp(4), dp(3), dp(4))
+                }
+                val sizes = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                npSizeButtons.clear()
+                listOf("S", "M", "L 73%", "全螢幕").forEachIndexed { index, label ->
+                    val b = button(label) { npSetCameraSize(index) }
+                    b.textSize = if (index == 3) 10.5f else 12f
+                    npSizeButtons.add(b)
+                    sizes.addView(b, LinearLayout.LayoutParams(0, dp(37), 1f).apply { rightMargin = dp(3) })
+                }
+                npCameraOptionDeck.addView(sizes,
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
+                val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                npFitButton = button("完整 Fit") { npSetCameraFill(false); npHideCameraOptions() }
+                actions.addView(npFitButton, LinearLayout.LayoutParams(0, dp(37), 1f).apply { rightMargin = dp(3) })
+                npRatioButton = button("調整比例") { npHideCameraOptions(); npShowSplitEditor() }
+                actions.addView(npRatioButton, LinearLayout.LayoutParams(0, dp(37), 1f).apply { rightMargin = dp(3) })
+                actions.addView(button("TPMS 放大") { npHideCameraOptions(); npShowTpms() },
+                    LinearLayout.LayoutParams(0, dp(37), 1f).apply { rightMargin = dp(3) })
+                actions.addView(button("3D 即時") { npHideCameraOptions(); npShow3dPreview() },
+                    LinearLayout.LayoutParams(0, dp(37), 1f))
+                npCameraOptionDeck.addView(actions,
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
+                npCameraSplitInfo = text("", 11.5f, textSoft).apply { gravity = Gravity.CENTER }
+                npCameraOptionDeck.addView(npCameraSplitInfo,
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(24)))
+                cameraPanel.addView(npCameraOptionDeck,
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                npSyncCameraOptions()
+            }
+
+            private fun npShowSplitEditor() {
+                // This dialog is safe without C4: it adjusts only two existing Android views.
+                val previous = npSplitPercent()
+                if (layoutPrefs().getInt("mode", 0) != 2) chooseDisplayMode(2)
+                npSetCustomSplit(previous)
+                val column = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(20), dp(10), dp(20), dp(8))
+                }
+                val label = text("", 16f)
+                val slider = android.widget.SeekBar(this).apply {
+                    max = 55  // 30% to 85%, leaving a usable map area.
+                    progress = previous.coerceIn(30, 85) - 30
+                }
+                label.text = "Carrot ${npSplitPercent()}%  /  地圖 ${100-npSplitPercent()}%"
+                column.addView(label, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(45)))
+                column.addView(slider, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(55)))
+                column.addView(text("預設 L = 73% · 可在 30%～85% 自行調整，旋轉後保留。", 11.5f, textSoft))
+                slider.setOnSeekBarChangeListener(object: android.widget.SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(bar: android.widget.SeekBar?, progress: Int, fromUser: Boolean) {
+                        if (!fromUser) return
+                        npSetCustomSplit(progress + 30)
+                        label.text = "Carrot ${npSplitPercent()}%  /  地圖 ${100-npSplitPercent()}%"
+                    }
+                    override fun onStartTrackingTouch(bar: android.widget.SeekBar?) {}
+                    override fun onStopTrackingTouch(bar: android.widget.SeekBar?) {}
+                })
+                AlertDialog.Builder(this).setTitle("調整 Carrot / 地圖比例")
+                    .setView(column)
+                    .setPositiveButton("完成", null)
+                    .setNeutralButton("恢復 73%") { _, _ ->
+                        layoutPrefs().edit().putBoolean("np_split_custom_enabled", false)
+                            .putInt("np_video_size", 2).apply()
+                        npApplySplitLayout()
+                        npSyncCameraOptions()
+                    }.show()
+            }
+
+            private fun npSetCustomSplit(percent: Int) {
+                val p = percent.coerceIn(30, 85)
+                layoutPrefs().edit().putBoolean("np_split_custom_enabled", true)
+                    .putInt("np_split_custom", p).apply()
+                npApplySplitLayout()
+                npSyncCameraOptions()
+            }
+
+            private fun npApplySplitLayout() {
+                if (!::content.isInitialized || !::cameraPanel.isInitialized || !::mapPanel.isInitialized) return
+                if (cameraPanel.parent !== content || mapPanel.parent !== content || focused) return
+                val horizontal = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                val cameraLp = cameraPanel.layoutParams as? LinearLayout.LayoutParams ?: return
+                val mapLp = mapPanel.layoutParams as? LinearLayout.LayoutParams ?: return
+                val percent = npSplitPercent().toFloat()
+                if (horizontal) {
+                    cameraLp.weight = percent
+                    mapLp.weight = 100f - percent
+                } else {
+                    cameraLp.weight = percent / 100f
+                    mapLp.weight = 1f - percent / 100f
+                }
+                cameraPanel.layoutParams = cameraLp
+                mapPanel.layoutParams = mapLp
+                content.requestLayout()
+            }
+
+        '''
+        change_block('private fun npInstallCameraControls() {','private fun npToggleCameraOptions() {',controls,'camera option toolbar')
+        functions='''    private fun npToggleCameraOptions() {
+                if (!::npCameraOptionDeck.isInitialized) return
+                npCameraOptionDeck.visibility = if (npCameraOptionDeck.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                npSyncCameraOptions()
+            }
+
+            private fun npHideCameraOptions() {
+                if (::npCameraOptionDeck.isInitialized) npCameraOptionDeck.visibility = View.GONE
+                npSyncCameraOptions()
+            }
+
+            private fun npSetCameraSize(size: Int) {
+                val choice = size.coerceIn(0, 3)
+                layoutPrefs().edit().putInt("np_video_size", choice)
+                    .putBoolean("np_split_custom_enabled", false).apply()
+                chooseDisplayMode(if (choice == 3) 3 else if (choice == 2) 2 else 1)
+                npHideCameraOptions()
+                npSyncCameraOptions()
+            }
+
+        '''
+        change_block('private fun npToggleCameraOptions() {','private fun npSetCameraFill(fill: Boolean) {',functions,'option state and size callbacks')
+
+        # Existing layout used a separate size weight and did not honour the "73%" label.
+        replace_unique('when (layoutPrefs().getInt("np_video_size", 1)) { 0 -> 0.85f; 1 -> 1.45f; 2 -> 2.7f; else -> 5f }',
+                       'npCameraLandscapeWeight()', 'horizontal ratio')
+        replace_unique('when (layoutPrefs().getInt("np_video_size", 1)) { 0 -> 0.30f; 1 -> 0.48f; 2 -> 0.70f; else -> 0.92f }',
+                       'npSplitPercent() / 100f', 'portrait video ratio')
+        replace_unique('when (layoutPrefs().getInt("np_video_size", 1)) { 0 -> 0.70f; 1 -> 0.52f; 2 -> 0.30f; else -> 0.08f }',
+                       '(100 - npSplitPercent()) / 100f', 'portrait map ratio')
+
+        # Refresh selection when using the old main menu, and when orientation changes.
+        replace_unique('renderLayout() // Re-parent the same WebViews, preserving stream and map position.',
+                       'renderLayout() // Re-parent the same WebViews, preserving stream and map position.\n                  npSyncCameraOptions()',
+                       'sync choice after display-mode change')
+        replace_unique('renderLayout() // Reuse existing WebViews, do not recreate streams on rotation.',
+                       'renderLayout() // Reuse existing WebViews, do not recreate streams on rotation.\n                  npSyncCameraOptions()',
+                       'sync after orientation change')
+
+        b=Path('app/build.gradle.kts');g=b.read_text(encoding='utf-8')
+        assert g.count('versionName = "4.9.5.1-live-lane-tpms-exit"') == 1
+        assert 'applicationIdSuffix = ".taiwan"' in g
+        assert 'signingConfig = signingConfigs.getByName("release")' in g
+        g=g.replace('versionName = "4.9.5.1-live-lane-tpms-exit"',
+                    'versionName = "4.9.6-interactive-split"',1)
+        g,count=re.subn(r'versionCode = (\d+)',lambda m:'versionCode = '+str(int(m.group(1))+1000000),g,count=1)
+        assert count == 1
+        b.write_text(g,encoding='utf-8')
+        manifest=Path('app/src/debug/AndroidManifest.xml')
+        m=manifest.read_text(encoding='utf-8')
+        assert m.count('NaviPilot Taiwan 4.9.5.1') == 1
+        manifest.write_text(m.replace('NaviPilot Taiwan 4.9.5.1','NaviPilot Taiwan 4.9.6',1),encoding='utf-8')
+        p.write_text(s,encoding='utf-8')
+        for target in ('npShowSplitEditor()', 'npCameraLandscapeWeight()', 'npSyncCameraOptions()',
+                       'Carrot 影像 ${npSplitPercent()}%', 'npSetCustomSplit(progress + 30)'):
+            assert target in s, target
+        print('v4.9.6: selectable mode buttons, 73%-default split, adjustable 30%-85% ratio and saved preferences')
+        NP_496_PY
+        python3 -m py_compile /tmp/np_patch_v496.py
+        python3 /tmp/np_patch_v496.py
+        grep -q 'versionName = "4.9.6-interactive-split"' app/build.gradle.kts
+    - name: Apply v4.9.7 drag divider and tap to swap Carrot and map
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat > /tmp/np_patch_v497.py <<'NP_497_PY'
+        #!/usr/bin/env python3
+        """v4.9.7: draggable split divider + tap-to-swap; keep existing WebViews."""
+        from pathlib import Path
+        import re
+
+        activity = Path("app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashActivity.kt")
+        s = activity.read_text(encoding="utf-8")
+
+        anchor = "    private fun npShowSplitEditor() {"
+        assert s.count(anchor) == 1, "Expected v4.9.6 split editor"
+        methods = """    // v4.9.7: Android-style split handle (display-only).
+            // No Carrot/CAN/navigation writes. Reuses the existing map and video WebViews.
+            private var npSplitHandle: FrameLayout? = null
+            private var npSplitTouchStart = 0f
+            private var npSplitStartPercent = 73
+            private var npSplitDragPercent = 73
+            private var npSplitMoved = false
+
+            private fun npPaneOrderReversed(): Boolean =
+                layoutPrefs().getBoolean("np_split_reversed", false)
+
+            private fun npAttachSplitPanes() {
+                if (!::content.isInitialized || !::cameraPanel.isInitialized || !::mapPanel.isInitialized) return
+                if (focused || cameraPanel.parent !== content || mapPanel.parent !== content) {
+                    npSplitHandle = null
+                    return
+                }
+                val cameraLp = cameraPanel.layoutParams as? LinearLayout.LayoutParams ?: return
+                val mapLp = mapPanel.layoutParams as? LinearLayout.LayoutParams ?: return
+                val horizontal = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                val handle = FrameLayout(this).apply {
+                    background = shape(Color.rgb(24, 70, 69), 10)
+                    isClickable = true
+                    isFocusable = true
+                    contentDescription = "拖曳調整影像與地圖比例，輕點交換兩個視窗"
+                }
+                val grip = text(if (horizontal) "⋮" else "≡", 20f, Color.rgb(101, 240, 207)).apply {
+                    gravity = Gravity.CENTER
+                    setTypeface(null, Typeface.BOLD)
+                }
+                handle.addView(grip, FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+                ))
+                handle.setOnClickListener { npSwapSplitPanes() }
+                handle.setOnTouchListener { v, event ->
+                    val axis = if (horizontal) event.rawX else event.rawY
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> {
+                            npSplitTouchStart = axis
+                            npSplitStartPercent = npSplitPercent()
+                            npSplitDragPercent = npSplitStartPercent
+                            npSplitMoved = false
+                            v.parent?.requestDisallowInterceptTouchEvent(true)
+                            true
+                        }
+                        MotionEvent.ACTION_MOVE -> {
+                            val delta = axis - npSplitTouchStart
+                            if (kotlin.math.abs(delta) >
+                                android.view.ViewConfiguration.get(this).scaledTouchSlop) {
+                                npSplitMoved = true
+                            }
+                            if (npSplitMoved) {
+                                val available = if (horizontal) content.width - handle.width
+                                                else content.height - handle.height
+                                if (available > 0) {
+                                    val direction = if (npPaneOrderReversed()) -1f else 1f
+                                    val next = (npSplitStartPercent +
+                                        (delta * direction * 100f / available)).roundToInt()
+                                        .coerceIn(30, 85)
+                                    npSplitDragPercent = next
+                                    npUpdateSplitWeights(next)
+                                }
+                            }
+                            true
+                        }
+                        MotionEvent.ACTION_UP -> {
+                            if (npSplitMoved) {
+                                npSetCustomSplit(npSplitDragPercent)
+                            } else {
+                                v.performClick() // onClick swaps panes; accessible to TalkBack as well.
+                            }
+                            true
+                        }
+                        MotionEvent.ACTION_CANCEL -> {
+                            npUpdateSplitWeights(npSplitStartPercent)
+                            true
+                        }
+                        else -> true
+                    }
+                }
+                npSplitHandle = handle
+
+                // Reparent only the two PANEL views; their embedded WebViews are reused.
+                // Do not call loadUrl(), reconnect C4, or recreate either WebView.
+                content.removeAllViews()
+                val handleLp = if (horizontal) {
+                    LinearLayout.LayoutParams(dp(30), ViewGroup.LayoutParams.MATCH_PARENT).apply {
+                        leftMargin = dp(2); rightMargin = dp(2)
+                    }
+                } else {
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(30)).apply {
+                        topMargin = dp(2); bottomMargin = dp(2)
+                    }
+                }
+                if (npPaneOrderReversed()) {
+                    content.addView(mapPanel, mapLp)
+                    content.addView(handle, handleLp)
+                    content.addView(cameraPanel, cameraLp)
+                } else {
+                    content.addView(cameraPanel, cameraLp)
+                    content.addView(handle, handleLp)
+                    content.addView(mapPanel, mapLp)
+                }
+                npUpdateSplitWeights(npSplitPercent())
+            }
+
+            private fun npUpdateSplitWeights(percent: Int) {
+                if (!::content.isInitialized || focused ||
+                    cameraPanel.parent !== content || mapPanel.parent !== content) return
+                val cameraLp = cameraPanel.layoutParams as? LinearLayout.LayoutParams ?: return
+                val mapLp = mapPanel.layoutParams as? LinearLayout.LayoutParams ?: return
+                val p = percent.coerceIn(30, 85).toFloat()
+                if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+                    cameraLp.weight = p
+                    mapLp.weight = 100f - p
+                } else {
+                    cameraLp.weight = p / 100f
+                    mapLp.weight = 1f - p / 100f
+                }
+                cameraPanel.layoutParams = cameraLp
+                mapPanel.layoutParams = mapLp
+                if (::npCameraSplitInfo.isInitialized) {
+                    npCameraSplitInfo.text =
+                        "Carrot ${p.toInt()}% / 地圖 ${100 - p.toInt()}% · 點分隔線交換"
+                }
+                content.requestLayout()
+            }
+
+            private fun npSwapSplitPanes() {
+                if (focused || mapPanel.parent !== content) return
+                layoutPrefs().edit()
+                    .putBoolean("np_split_reversed", !npPaneOrderReversed()).apply()
+                npAttachSplitPanes()
+                Toast.makeText(this, "已交換 Carrot 與地圖位置", Toast.LENGTH_SHORT).show()
+            }
+
+        """
+        s = s.replace(anchor, methods + anchor, 1)
+
+        # Insert splitter into EVERY non-fullscreen render (the helper skips focused).
+        # Do not modify the old layout weighting or nested WebViews.
+        footer_anchor = 'val footer = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; pad(this, 5) }'
+        assert s.count(footer_anchor) == 1, "Expected one renderLayout footer anchor"
+        s = s.replace(footer_anchor, 'npAttachSplitPanes()\n                  ' + footer_anchor, 1)
+
+        activity.write_text(s, encoding="utf-8")
+
+        build = Path("app/build.gradle.kts")
+        g = build.read_text(encoding="utf-8")
+        assert g.count('versionName = "4.9.6-interactive-split"') == 1
+        assert 'applicationIdSuffix = ".taiwan"' in g
+        assert 'signingConfig = signingConfigs.getByName("release")' in g
+        g = g.replace('versionName = "4.9.6-interactive-split"',
+                      'versionName = "4.9.7-drag-swap-split"', 1)
+        g, n = re.subn(r'versionCode = (\d+)',
+                       lambda m: "versionCode = " + str(int(m.group(1)) + 1000000),
+                       g, count=1)
+        assert n == 1
+        build.write_text(g, encoding="utf-8")
+
+        manifest = Path("app/src/debug/AndroidManifest.xml")
+        m = manifest.read_text(encoding="utf-8")
+        assert m.count("NaviPilot Taiwan 4.9.6") == 1
+        manifest.write_text(m.replace("NaviPilot Taiwan 4.9.6", "NaviPilot Taiwan 4.9.7", 1), encoding="utf-8")
+        for marker in ("npAttachSplitPanes()", "npUpdateSplitWeights(next)",
+                       "npSwapSplitPanes()", "np_split_reversed", "MotionEvent.ACTION_MOVE",
+                       "v.performClick()", "content.addView(mapPanel, mapLp)"):
+            assert marker in s, marker
+        print("v4.9.7 split-handle patch applied: drag 30..85%, tap swap, saved orientation and ratio.")
+        NP_497_PY
+        python3 -m py_compile /tmp/np_patch_v497.py
+        python3 /tmp/np_patch_v497.py
+        grep -q 'versionName = "4.9.7-drag-swap-split"' app/build.gradle.kts
+    - name: Apply v4.9.8 read-only diagnostic drawer and OpenFreeMap preview
+      shell: bash
+      run: "set -euo pipefail\ncat > /tmp/TaiwanExtras498.kt <<'NP_498_KOTLIN'\npackage com.jixiexiaoge.drivingassist\n\nimport android.app.Activity\n\
+        import android.app.AlertDialog\nimport android.content.res.Configuration\nimport android.graphics.Color\nimport android.graphics.drawable.GradientDrawable\n\
+        import android.location.Location\nimport android.os.Handler\nimport android.os.Looper\nimport android.view.Gravity\nimport android.view.ViewGroup\n\
+        import android.webkit.WebView\nimport android.webkit.WebViewClient\nimport android.widget.FrameLayout\nimport android.widget.LinearLayout\n\
+        import android.widget.ScrollView\nimport android.widget.TextView\nimport org.json.JSONObject\nimport org.json.JSONTokener\nimport java.util.Locale\n\
+        \n/**\n * NaviPilot Taiwan optional, read-only diagnostic panels.\n * This object only inspects the existing Carrot WebView. It does not\
+        \ open a second\n * Carrot WebSocket, write C4 parameters, or change vehicle control.\n */\ninternal object TaiwanExtras498 {\n    private\
+        \ fun dp(host: Activity, value: Int) =\n        (value * host.resources.displayMetrics.density + 0.5f).toInt()\n\n    private fun pillBackground(host:\
+        \ Activity): GradientDrawable = GradientDrawable().apply {\n        setColor(Color.argb(214, 12, 60, 58))\n        cornerRadius = dp(host,\
+        \ 11).toFloat()\n        setStroke(dp(host, 1), Color.rgb(57, 196, 161))\n    }\n\n    /** Wrap the existing WebView once: preserve its\
+        \ instance and weighted height. */\n    fun installCameraTab(host: Activity, cameraPanel: LinearLayout, carrot: WebView,\n           \
+        \              openDetails: () -> Unit) {\n        val parent = carrot.parent as? LinearLayout ?: return\n        if (parent !== cameraPanel)\
+        \ return\n        val index = parent.indexOfChild(carrot)\n        val layout = carrot.layoutParams as? LinearLayout.LayoutParams ?: return\n\
+        \        parent.removeView(carrot)\n        val wrapper = FrameLayout(host)\n        wrapper.addView(carrot, FrameLayout.LayoutParams(\n\
+        \            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))\n        val tab = TextView(host).apply {\n  \
+        \          text = \"資訊\"\n            textSize = 11f\n            setTextColor(Color.WHITE)\n            gravity = Gravity.CENTER\n  \
+        \          background = pillBackground(host)\n            contentDescription = \"展開 NaviPilot 車況與診斷資料\"\n            setOnClickListener\
+        \ { openDetails() }\n        }\n        wrapper.addView(tab, FrameLayout.LayoutParams(dp(host, 32), dp(host, 68),\n            Gravity.START\
+        \ or Gravity.CENTER_VERTICAL).apply { leftMargin = dp(host, 2) })\n        parent.addView(wrapper, index, layout)\n    }\n\n    fun showDiagnostics(host:\
+        \ Activity, carrot: WebView?, gps: Location?) {\n        val outer = ScrollView(host).apply { setBackgroundColor(Color.rgb(11, 27, 33))\
+        \ }\n        val content = LinearLayout(host).apply {\n            orientation = LinearLayout.VERTICAL\n            setPadding(dp(host,\
+        \ 16), dp(host, 14), dp(host, 16), dp(host, 18))\n        }\n        outer.addView(content)\n        fun paragraph(text: String, prominent:\
+        \ Boolean = false): TextView = TextView(host).apply {\n            this.text = text\n            textSize = if (prominent) 15f else 13f\n\
+        \            setTextColor(if (prominent) Color.rgb(118, 236, 201) else Color.rgb(222, 241, 238))\n            setPadding(0, dp(host, if\
+        \ (prominent) 12 else 7), 0, dp(host, 7))\n            content.addView(this)\n        }\n        paragraph(\"車輛 / 模型 / 連線資料\", true)\n\
+        \        val gpsText = gps?.takeIf { it.hasAccuracy() && it.accuracy.isFinite() }\n            ?.let { \"GPS 精度約 ${it.accuracy.toInt()}\
+        \ m\" } ?: \"GPS 精度：尚未取得\"\n        paragraph(gpsText)\n        val liveText = paragraph(\"等待 C4 資料...\\n原版的車端寫入控制在此版本未啟用。\")\n      \
+        \  paragraph(\"原版功能索引（分階段整合）\", true)\n        paragraph(\"已列入此面板：車速、巡航、方向盤角度、胎壓、模型線、雷達追蹤狀態。\\n\" +\n            \"導航路線、道路辨識、裝置健康、操作紀錄、進階控制將逐項加入；此處不會假裝已支援。\"\
+        )\n        paragraph(\"資料僅供監看；未接收到有效 C4 資料時一律顯示『—』。側車資訊不構成盲點安全判斷。\")\n        val dialog = AlertDialog.Builder(host).setTitle(\"NaviPilot\
+        \ · 完整資訊\")\n            .setView(outer).setPositiveButton(\"關閉\", null).create()\n        val handler = Handler(Looper.getMainLooper())\n\
+        \        var running = true\n        val poll = object : Runnable {\n            override fun run() {\n                if (!running ||\
+        \ host.isFinishing || host.isDestroyed) return\n                if (carrot == null || carrot.url.isNullOrBlank() || carrot.url == \"about:blank\"\
+        ) {\n                    liveText.text = \"C4 未連線／正在等待 Carrot Web。\\n\" +\n                        \"車輛控制：未啟用；道路模式：尚未辨識。\"\n         \
+        \       } else {\n                    runCatching {\n                        carrot.evaluateJavascript(CARROT_READONLY_SNAPSHOT) { response\
+        \ ->\n                            if (running && dialog.isShowing) {\n                                liveText.text = renderStatus(response)\n\
+        \                            }\n                        }\n                    }.onFailure { liveText.text = \"無法取得 C4 即時資料。\" }\n   \
+        \             }\n                handler.postDelayed(this, 1600L)\n            }\n        }\n        dialog.setOnDismissListener { running\
+        \ = false; handler.removeCallbacks(poll) }\n        dialog.show()\n        handler.post(poll)\n    }\n\n    private fun renderStatus(encoded:\
+        \ String?): String {\n        if (encoded.isNullOrBlank() || encoded == \"null\") return \"C4 回應尚未就緒。\"\n        return try {\n      \
+        \      val value = JSONTokener(encoded).nextValue()\n            val root = when (value) {\n                is JSONObject -> value\n \
+        \               is String -> JSONObject(value)\n                else -> return \"C4 回應格式不支援。\"\n            }\n            if (root.has(\"\
+        error\")) return \"C4 讀取異常：${root.optString(\"error\").take(100)}\"\n            if (!root.optBoolean(\"ready\", false)) return \"C4 尚未提供即時車輛資料。\"\
+        \n            fun number(key: String, suffix: String = \"\", decimals: Int = 0): String {\n                val n = root.optDouble(key,\
+        \ Double.NaN)\n                return if (!n.isFinite()) \"—\" else\n                    String.format(Locale.TAIWAN, \"%1$.${decimals}f\"\
+        , n) + suffix\n            }\n            val tpms = root.optJSONObject(\"tpms\")\n            fun pressure(key: String): String {\n \
+        \               val n = tpms?.optDouble(key, Double.NaN) ?: Double.NaN\n                return if (!n.isFinite() || n !in 5.0..100.0)\
+        \ \"—\" else\n                    String.format(Locale.TAIWAN, \"%.0f\", n)\n            }\n            val roadType = root.optInt(\"\
+        roadType\", -1)\n            val roadText = when (roadType) {\n                0 -> \"高速候選（僅資料來源代碼，未交叉確認）\"\n                6 -> \"快速道路候選（未交叉確認）\"\
+        \n                -1 -> \"未知（尚未完成道路辨識）\"\n                else -> \"道路類型代碼 $roadType（未分類）\"\n            }\n            val laneCount\
+        \ = root.optInt(\"modelLines\", -1)\n            val laneText = if (laneCount < 0) \"—\" else \"$laneCount 條模型線（不是實際車道數）\"\n         \
+        \   val tracks = if (root.isNull(\"leftTracks\") || !root.has(\"leftTracks\")) \"—\" else {\n                \"左 ${root.optInt(\"leftTracks\"\
+        )}、中 ${root.optInt(\"centerTracks\")}、右 ${root.optInt(\"rightTracks\")}\" \n            }\n            \"C4 資料：已接收到 Web 頁面狀態\\n\" +\n\
+        \                \"車速：${number(\"speedKph\", \" km/h\", 1)}\\n\" +\n                \"巡航設定：${number(\"cruiseKph\", \" km/h\")}\\n\" +\n\
+        \                \"方向盤角度：${number(\"steerDeg\", \"°\", 1)}\\n\" +\n                \"前輪胎壓：左 ${pressure(\"fl\")} / 右 ${pressure(\"fr\"\
+        )} psi\\n\" +\n                \"後輪胎壓：左 ${pressure(\"rl\")} / 右 ${pressure(\"rr\")} psi\\n\" +\n                \"模型：$laneText\\n\" +\n\
+        \                \"車輛追蹤：$tracks\\n\" +\n                \"道路辨識：$roadText\\n\" +\n                \"彎道減速控制：未啟用（只觀測）\"\n        } catch\
+        \ (_: Exception) {\n            \"C4 資料解析失敗，保持原版導航及車輛控制不變。\"\n        }\n    }\n\n    /** The same Carrot WebView already maintains its\
+        \ own compact-state socket. */\n    private val CARROT_READONLY_SNAPSHOT = \"\"\"(function(){\n      try {\n        const h=window.CarrotHudState||{};\n\
+        \        const o=window.CarrotOverlayState||{};\n        const c=h.carState||{};\n        const m=o.modelV2||{};\n        const r=o.radarState||null;\n\
+        \        const tp=c.tpms||window.CarrotHudDataBridge?.deriveVehicleHudPayload?.(h)?.tpms||{};\n        const road=h.carrotNavi?.roadType??o.carrotNavi?.roadType??h.carrotMan?.roadType??null;\n\
+        \        function leadCount(v){return Array.isArray(v)?v.filter(x=>x&&x.status).length:0;}\n        return JSON.stringify({\n        \
+        \  ready:Object.keys(h).length>0 || Object.keys(o).length>0,\n          speedKph:Number.isFinite(c.vEgo)?c.vEgo*3.6:null,\n          cruiseKph:Number.isFinite(c.vCruiseCluster)?c.vCruiseCluster:null,\n\
+        \          steerDeg:Number.isFinite(c.steeringAngleDeg)?c.steeringAngleDeg:null,\n          tpms:tp,\n          modelLines:Array.isArray(m.laneLines)?m.laneLines.length:null,\n\
+        \          leftTracks:r?leadCount(r.leadsLeft):null,\n          centerTracks:r?leadCount(r.leadsCenter):null,\n          rightTracks:r?leadCount(r.leadsRight):null,\n\
+        \          roadType:Number.isInteger(road)?road:null\n        });\n      } catch (e) {return JSON.stringify({error:String(e)});}\n   \
+        \ })()\"\"\"\n\n    /** Optional map-only preview: does not modify the built-in navigational WebView. */\n    fun showMapPreview(host:\
+        \ Activity, gps: Location?) {\n        AlertDialog.Builder(host).setTitle(\"預覽 OpenFreeMap 地圖？\")\n            .setMessage(\"這個畫面會透過網路載入\
+        \ MapLibre 與 OpenFreeMap 圖磚，並可能傳送目前顯示的地圖範圍。\" +\n                \"它不會取代既有導航地圖，也不會提供 Google 即時路況。\")\n            .setNegativeButton(\"\
+        取消\", null)\n            .setPositiveButton(\"開啟預覽\") { _, _ ->\n                val web = WebView(host).apply {\n                   \
+        \ setBackgroundColor(Color.rgb(12, 31, 38))\n                    settings.javaScriptEnabled = true\n                    settings.domStorageEnabled\
+        \ = false\n                    settings.allowFileAccess = false\n                    settings.allowContentAccess = false\n           \
+        \         settings.mediaPlaybackRequiresUserGesture = true\n                    webViewClient = object : WebViewClient() {\n         \
+        \               override fun onPageFinished(view: WebView?, url: String?) {\n                            val loc = gps?.takeIf { it.latitude.isFinite()\
+        \ && it.longitude.isFinite() }\n                            if (loc != null && url != \"about:blank\") {\n                           \
+        \     val js = String.format(Locale.US,\n                                    \"window.__np498Position=[%.7f,%.7f];\" +\n             \
+        \                       \"window.__np498SetCenter&&window.__np498SetCenter(%.7f,%.7f);\",\n                                    loc.longitude,\
+        \ loc.latitude, loc.longitude, loc.latitude)\n                                view?.evaluateJavascript(js, null)\n                   \
+        \         }\n                        }\n                    }\n                    val html = assetsPreview(host)\n                  \
+        \  loadDataWithBaseURL(\"https://openfreemap.org/\", html, \"text/html\", \"UTF-8\", null)\n                }\n                val container\
+        \ = FrameLayout(host).apply {\n                    addView(web, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,\n      \
+        \                  dp(host, if (host.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) 300 else 470)))\n   \
+        \             }\n                val alert = AlertDialog.Builder(host)\n                    .setTitle(\"MapLibre · OpenFreeMap（試用）\")\n\
+        \                    .setView(container)\n                    .setPositiveButton(\"關閉\", null)\n                    .create()\n      \
+        \          alert.setOnDismissListener {\n                    web.stopLoading()\n                    web.loadUrl(\"about:blank\")\n   \
+        \                 (web.parent as? ViewGroup)?.removeView(web)\n                    web.destroy()\n                }\n                alert.show()\n\
+        \            }.show()\n    }\n\n    private fun assetsPreview(host: Activity): String =\n        host.assets.open(\"np_maplibre_preview_498.html\"\
+        ).bufferedReader(Charsets.UTF_8).use { it.readText() }\n}\nNP_498_KOTLIN\ncat > /tmp/np_maplibre_preview_498.html <<'NP_498_HTML'\n<!doctype\
+        \ html>\n<html lang=\"zh-Hant\"><head><meta charset=\"utf-8\"/>\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,maximum-scale=1\"\
+        />\n<link href=\"https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/5.0.0/maplibre-gl.css\" rel=\"stylesheet\" />\n<style>\nhtml,body,#map{margin:0;height:100%;width:100%;background:#0a202b;color:#e8fcf5;font-family:system-ui,sans-serif}\n\
+        #map{position:absolute;inset:0}\n#state{position:absolute;top:10px;left:10px;right:10px;z-index:3;padding:11px 12px;border-radius:12px;background:#102c36e6;border:1px\
+        \ solid #236b63;font-size:13px}\n#caption{position:absolute;bottom:12px;left:9px;right:9px;z-index:3;font-size:11px;pointer-events:none;text-shadow:0\
+        \ 1px 3px #000;padding:8px;background:#11212c99;border-radius:8px}\n</style></head><body>\n<div id=\"map\"></div><div id=\"state\">載入\
+        \ MapLibre／OpenFreeMap 中…</div>\n<div id=\"caption\">獨立新地圖預覽 · 不影響原有導航 · 非即時路況</div>\n<script src=\"https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/5.0.0/maplibre-gl.js\"\
+        ></script>\n<script>\n(function(){'use strict';\n  const state=document.getElementById('state');\n  const isValid=p=>Array.isArray(p)&&p.length===2&&p.every(v=>Number.isFinite(v));\n\
+        \  const initial=isValid(window.__np498Position)?window.__np498Position:[120.8,23.6];\n  if (!window.maplibregl) {state.textContent='MapLibre\
+        \ 未載入：請確認網路後重試，原本導航未受影響';return;}\n  if (!maplibregl.supported()) {state.textContent='此手機 WebView 不支援必要的 WebGL，請使用原本地圖';return;}\n  try\
+        \ {\n    const map=new maplibregl.Map({\n      container:'map', style:'https://tiles.openfreemap.org/styles/liberty',\n      center:initial,\
+        \ zoom:initial[0]===120.8?6.5:15, attributionControl:true\n    });\n    map.addControl(new maplibregl.NavigationControl({showCompass:true}),\
+        \ 'bottom-right');\n    map.on('load',()=>{state.textContent='OpenFreeMap 已載入 · 試用地圖'; setTimeout(()=>{state.style.display='none'},2300);\n\
+        \      if(isValid(window.__np498Position))map.easeTo({center:window.__np498Position,zoom:15});});\n    map.on('error',()=>{state.textContent='圖磚連線異常，可關閉預覽恢復既有地圖';});\n\
+        \    window.__np498SetCenter=(lon,lat)=>{if(Number.isFinite(lon)&&Number.isFinite(lat))map.easeTo({center:[lon,lat],zoom:15});};\n  }\
+        \ catch(e) {state.textContent='地圖無法初始化：'+String(e).slice(0,85);}\n})();\n</script></body></html>\nNP_498_HTML\ncat > /tmp/np_patch_v498.py\
+        \ <<'NP_498_PATCH'\n#!/usr/bin/env python3\n\"\"\"Add optional read-only original-data drawer and separate new-map preview.\n\nBuild on\
+        \ the reviewed v4.9.7 Taiwan dashboard generator, preserving its\nGoogle sharing, Carrot/Map WebViews, split gestures, and no-car-control\
+        \ policy.\n\"\"\"\nfrom pathlib import Path\nimport re\n\np = Path('app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashActivity.kt')\n\
+        s = p.read_text(encoding='utf-8')\n\ndef one(old, new, label):\n    global s\n    count = s.count(old)\n    if count != 1:\n        raise\
+        \ RuntimeError('v4.9.8 %s expected one anchor; found %d' % (label, count))\n    s = s.replace(old, new, 1)\n\none('''                npInstallCameraControls()''',\n\
+        \    '''                npInstallCameraControls()\n                npInstallDataChip()''', 'install discreet info tab')\n\none('''\"⚙\
+        \ 權限與診斷\"''',\n    '''\"⚙ 權限與診斷\",\n                       \"ⓘ 車況／原版診斷資料\",\n                       \"\U0001F5FA MapLibre 開源地圖預覽\"''',\n\
+        \    'quick controls menu choices')\none('''4 -> showOptions()''',\n    '''4 -> showOptions()\n                           5 -> npShowReadOnlyDetails()\n\
+        \                           6 -> npOpenMapPreview()''',\n    'quick controls menu handlers')\n\nhelpers = '''    // v4.9.8: optional native\
+        \ UI. Carrot and navigation views are not recreated.\n    // No 7000 / 7706 / 7714 write operations or auto speed changes.\n    private\
+        \ fun npInstallDataChip() {\n        TaiwanExtras498.installCameraTab(this, cameraPanel, carrot) {\n            npShowReadOnlyDetails()\n\
+        \        }\n    }\n\n    private fun npShowReadOnlyDetails() {\n        val connectedPage = cameraLive && ::carrot.isInitialized &&\n\
+        \            isSameCarrot(carrot.url.orEmpty())\n        TaiwanExtras498.showDiagnostics(this, if (connectedPage) carrot else null, lastPosition)\n\
+        \    }\n\n    private fun npOpenMapPreview() {\n        TaiwanExtras498.showMapPreview(this, lastPosition)\n    }\n\n'''\none('    private\
+        \ fun connectCarrot() {', helpers + '    private fun connectCarrot() {',\n    'optional dashboard helper methods')\np.write_text(s, encoding='utf-8')\n\
+        \npackage = Path('app/src/main/java/com/jixiexiaoge/drivingassist')\npackage.joinpath('TaiwanExtras498.kt').write_text(\n    Path('/tmp/TaiwanExtras498.kt').read_text(encoding='utf-8'),\
+        \ encoding='utf-8')\nassets = Path('app/src/main/assets')\nassets.mkdir(parents=True, exist_ok=True)\nassets.joinpath('np_maplibre_preview_498.html').write_text(\n\
+        \    Path('/tmp/np_maplibre_preview_498.html').read_text(encoding='utf-8'), encoding='utf-8')\n\nb = Path('app/build.gradle.kts')\ng =\
+        \ b.read_text(encoding='utf-8')\nassert g.count('versionName = \"4.9.7-drag-swap-split\"') == 1\nassert 'applicationIdSuffix = \".taiwan\"\
+        ' in g\nassert 'signingConfig = signingConfigs.getByName(\"release\")' in g\ng = g.replace('versionName = \"4.9.7-drag-swap-split\"',\n\
+        \              'versionName = \"4.9.8-readonly-diagnostics-map-preview\"', 1)\ng, n = re.subn(r'versionCode = (\\d+)',\n             \
+        \  lambda m: 'versionCode = ' + str(int(m.group(1)) + 1000000), g, count=1)\nassert n == 1\nb.write_text(g, encoding='utf-8')\n\nmanifest\
+        \ = Path('app/src/debug/AndroidManifest.xml')\nm = manifest.read_text(encoding='utf-8')\nassert m.count('NaviPilot Taiwan 4.9.7') == 1\n\
+        manifest.write_text(m.replace('NaviPilot Taiwan 4.9.7',\n                              'NaviPilot Taiwan 4.9.8', 1), encoding='utf-8')\n\
+        \nfor token in ('npInstallDataChip()', 'npShowReadOnlyDetails()',\n              'npOpenMapPreview()', 'TaiwanExtras498.showDiagnostics',\n\
+        \              'TaiwanExtras498.showMapPreview'):\n    assert token in s, token\nassert 'import android.app.Activity' in package.joinpath('TaiwanExtras498.kt').read_text()\n\
+        assert 'https://tiles.openfreemap.org/styles/liberty' in assets.joinpath('np_maplibre_preview_498.html').read_text()\nprint('v4.9.8 read-only\
+        \ diagnostics and independent MapLibre/OpenFreeMap preview applied.')\nNP_498_PATCH\npython3 -m py_compile /tmp/np_patch_v498.py\npython3\
+        \ /tmp/np_patch_v498.py\ngrep -q 'versionName = \"4.9.8-readonly-diagnostics-map-preview\"' app/build.gradle.kts\n"
+    - name: Compile signed v4.9.8 APK (Gradle network retry)
+      shell: bash
+      run: |
+        set -euo pipefail
+        chmod +x gradlew
+        # The repository uses Gradle 9.2.1. The wrapper's default network timeout
+        # can fail on temporary GitHub runner / services.gradle.org slowdowns.
+        WRAPPER_PROPERTIES=gradle/wrapper/gradle-wrapper.properties
+        test -f "$WRAPPER_PROPERTIES"
+        if grep -Eq '^networkTimeout=' "$WRAPPER_PROPERTIES"; then
+          sed -i 's/^networkTimeout=.*/networkTimeout=120000/' "$WRAPPER_PROPERTIES"
+        else
+          printf '\nnetworkTimeout=120000\n' >> "$WRAPPER_PROPERTIES"
+        fi
+        for attempt in 1 2 3; do
+          echo "Gradle assemble attempt $attempt of 3"
+          if ./gradlew :app:assembleDebug --no-daemon --stacktrace; then
+            echo "Gradle build succeeded on attempt $attempt"
+            exit 0
+          fi
+          if [ "$attempt" -lt 3 ]; then
+            echo "Gradle failed; waiting 15 seconds before retry (covers transient distribution/network errors)."
+            sleep 15
+          fi
+        done
+        echo "Gradle failed on all 3 attempts. Please inspect the full build log; a Kotlin compile error will also fail repeatedly."
+        exit 1
+    - name: Verify signed package identity
+      shell: bash
+      run: |
+        set -euo pipefail
+        APK=$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)
+        test -n "$APK"
+        "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | grep -F "package: name='com.jixiexiaoge.drivingassist.taiwan'"
+        "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
+        echo 'Verified stable ID and APK signing.'
+    - name: Upload signed NaviPilot v4.9.8 APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: NaviPilot-Taiwan-Dashboard-v498-signed
+        path: app/build/outputs/apk/debug/*.apk
+        if-no-files-found: error
+        retention-days: 14
+'on':
+  workflow_dispatch: null
