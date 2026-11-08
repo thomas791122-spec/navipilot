@@ -1,0 +1,418 @@
+name: Build NaviPilot Taiwan Dashboard v4.9.4 (Compact video controls + TPMS)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    env:
+      TW_KEYSTORE_B64: ${{ secrets.NAVIPILOT_TW_KEYSTORE_B64 }}
+      TW_KEYSTORE_PASSWORD: ${{ secrets.NAVIPILOT_TW_PASSWORD }}
+    steps:
+      - name: Checkout NaviPilot source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install Android toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;26.1.10909125' 'cmake;3.22.1'
+          yes | sdkmanager --licenses > /dev/null || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Rebuild verified v4.9.2 source patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_REPLAY_V492'
+          from pathlib import Path
+          import hashlib, os, subprocess
+          source=Path('.github/workflows/build-taiwan-dashboard-v4-9-2-carrot-vision-tpms.yml')
+          data=source.read_bytes()
+          expected='af81c0a927d6f02d06c0e42538663595d970d3bf'
+          sha=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\x00'+data).hexdigest()
+          if sha != expected:
+              raise SystemExit('The reviewed v4.9.2 workflow changed; refusing unreviewed source generator: '+sha)
+          steps=[]
+          current=None
+          collecting=False
+          lines=[]
+          def flush():
+              global current, collecting, lines
+              if current and collecting:
+                  steps.append((current, '\n'.join(lines)+'\n'))
+              collecting=False
+              lines=[]
+          for line in data.decode('utf-8').splitlines():
+              if line.startswith('      - name: '):
+                  flush()
+                  current=line[len('      - name: '):].strip()
+              elif current and line=='        run: |':
+                  collecting=True
+              elif collecting:
+                  if line.startswith('          '):
+                      lines.append(line[10:])
+                  elif not line.strip():
+                      lines.append('')
+                  else:
+                      flush()
+          flush()
+          selected=[(name, script) for name,script in steps
+              if name.startswith('Recreate exact approved v4.1 base') or name.startswith('Add v4.') or name.startswith('Fix v4.9.1')]
+          if len(selected)!=11:
+              raise SystemExit('Expected 11 reviewed v4.1..v4.9.2 patch stages; got '+str([x[0] for x in selected]))
+          env=os.environ.copy()
+          if not env.get('TW_KEYSTORE_B64') or not env.get('TW_KEYSTORE_PASSWORD'):
+              raise SystemExit('Signing secrets are required to preserve existing install identity.')
+          for name, script in selected:
+              print('Executing approved stage:',name,flush=True)
+              subprocess.run(['bash','-e','-o','pipefail'],input=script,text=True,env=env,check=True)
+          PY_REPLAY_V492
+
+      - name: Apply v4.9.3 responsive dashboard and TPMS patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/np_carrot_ui_v493.js <<'NP_UI_493_JS'
+          (function () {
+            'use strict';
+            if (window.__npUi493Ready) return;
+            window.__npUi493Ready = true;
+            let overlay = null;
+            let popupTimer = null;
+            const style = document.createElement('style');
+            style.id = 'np-ui-v493';
+            style.textContent = [
+              'html.np-camera-fill #carrotStage video{object-fit:cover!important;width:100%!important;height:100%!important}',
+              'html.np-camera-fit #carrotStage video{object-fit:contain!important;width:100%!important;height:100%!important}',
+              '#np-tpms-overlay{position:fixed;inset:0;z-index:2147483640;background:rgba(0,10,17,.82);display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box;font-family:system-ui,sans-serif}',
+              '#np-tpms-overlay .np-card{width:min(94vw,620px);max-height:90dvh;overflow:auto;background:#102229;color:#f5ffff;border:1px solid #33a990;border-radius:20px;box-shadow:0 15px 55px #000a;padding:16px;box-sizing:border-box}',
+              '#np-tpms-overlay .np-title{display:flex;justify-content:space-between;align-items:center;font-weight:700;font-size:19px;margin-bottom:14px}',
+              '#np-tpms-overlay button{background:#176b63;border:0;color:white;border-radius:12px;min-width:62px;min-height:38px;font-size:15px}',
+              '#np-tpms-overlay .np-source{display:flex;align-items:center;justify-content:center;min-height:145px;overflow:hidden;background:#09191e;border-radius:14px;padding:18px}',
+              '#np-tpms-overlay .np-source .chud-tpms{display:block!important;visibility:visible!important;width:min(72vw,420px)!important;min-width:210px!important;max-width:none!important;height:auto!important;max-height:none!important;font-size:20px!important;transform:none!important}',
+              '#np-tpms-overlay .np-hint{font-size:12px;color:#92b5b6;margin-top:12px;line-height:1.5}'
+            ].join(';');
+            document.head.appendChild(style);
+          
+            window.__npCameraFill = function (fill) {
+              const root = document.documentElement;
+              root.classList.toggle('np-camera-fill', !!fill);
+              root.classList.toggle('np-camera-fit', !fill);
+              const stage = document.getElementById('carrotStage');
+              if (!stage) return 'waiting-for-stage';
+              const videos = stage.querySelectorAll('video');
+              videos.forEach(function (v) {
+                v.style.setProperty('object-fit', fill ? 'cover' : 'contain', 'important');
+                v.style.setProperty('width', '100%', 'important');
+                v.style.setProperty('height', '100%', 'important');
+              });
+              return videos.length ? 'camera-fit-applied' : 'video-element-not-found';
+            };
+          
+            function refreshTpms() {
+              if (!overlay) return;
+              const holder = overlay.querySelector('.np-source');
+              const source = document.querySelector('#carrotStage .chud-tpms');
+              if (!holder) return;
+              if (!source) {
+                holder.textContent = 'C4 尚未提供可顯示的胎壓資料';
+                return;
+              }
+              const clone = source.cloneNode(true);
+              clone.removeAttribute('id');
+              holder.replaceChildren(clone);
+            }
+            function closeTpms() {
+              if (popupTimer) clearInterval(popupTimer);
+              popupTimer = null;
+              if (overlay) overlay.remove();
+              overlay = null;
+            }
+            window.__npTpmsToggle = function () {
+              if (overlay) { closeTpms(); return 'closed'; }
+              overlay = document.createElement('div');
+              overlay.id = 'np-tpms-overlay';
+              overlay.innerHTML = '<div class="np-card"><div class="np-title"><span>TPMS 四輪胎壓</span><button type="button" id="np-tpms-close">關閉</button></div><div class="np-source">讀取 C4 胎壓中…</div><div class="np-hint">放大 Carrot Web 原始胎壓資訊，無資料不顯示模擬數值。此為觀測畫面，不作為行車控制依據。</div></div>';
+              overlay.querySelector('#np-tpms-close').addEventListener('click', closeTpms);
+              overlay.addEventListener('click', function (e) { if (e.target === overlay) closeTpms(); });
+              document.body.appendChild(overlay);
+              refreshTpms();
+              popupTimer = setInterval(refreshTpms, 1500);
+              return 'opened';
+            };
+          })();
+          NP_UI_493_JS
+          node --check /tmp/np_carrot_ui_v493.js
+          cat > /tmp/np_patch_v493.py <<'NP_PATCH_493_PY'
+          #!/usr/bin/env python3
+          """Apply the NaviPilot Taiwan v4.9.3 read-only UI update AFTER v4.9.2 steps."""
+          from pathlib import Path
+          import json
+          import re
+          
+          root = Path('app/src/main/java/com/jixiexiaoge/drivingassist')
+          p = root / 'TaiwanDashActivity.kt'
+          s = p.read_text(encoding='utf-8')
+          
+          def once(old, new, label):
+              global s
+              n = s.count(old)
+              if n != 1:
+                  raise RuntimeError('v4.9.3 patch anchor %s: expected 1, got %s' % (label, n))
+              s = s.replace(old, new, 1)
+          
+          # Teal dashboard colors, no vehicle or navigation commands.
+          for before, after in [
+              ('private val bg = Color.rgb(9, 17, 30)', 'private val bg = Color.rgb(8, 22, 29)'),
+              ('private val panelColor = Color.rgb(22, 35, 54)', 'private val panelColor = Color.rgb(17, 39, 46)'),
+              ('private val blue = Color.rgb(35, 121, 223)', 'private val blue = Color.rgb(0, 151, 130)'),
+          ]:
+              if before in s:
+                  s = s.replace(before, after, 1)
+          
+          # S/M/L change camera-panel size in both orientations. Retain the same WebViews.
+          weights = [
+              ('if (cameraLarge) 2.7f else 1.15f',
+               'when (layoutPrefs().getInt("np_video_size", 1)) { 0 -> 0.85f; 1 -> 1.45f; 2 -> 2.7f; else -> 5f }'),
+              ('if (cameraLarge) 0.70f else 0.46f',
+               'when (layoutPrefs().getInt("np_video_size", 1)) { 0 -> 0.30f; 1 -> 0.48f; 2 -> 0.70f; else -> 0.92f }'),
+              ('if (cameraLarge) 0.30f else 0.54f',
+               'when (layoutPrefs().getInt("np_video_size", 1)) { 0 -> 0.70f; 1 -> 0.52f; 2 -> 0.30f; else -> 0.08f }'),
+          ]
+          for old, new in weights:
+              once(old, new, 'responsive video weight ' + old)
+          
+          # Compact two-line toolbar remains accessible in portrait and landscape.
+          needle = 'cameraPanel.addView(cameraStatus, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(26)))'
+          once(needle, needle + '\n                npInstallCameraControls()', 'camera controls after original status')
+          
+          html = '''<!doctype html><html lang="zh-Hant"><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+          html,body{margin:0;background:#08161d;color:#eafffa;font-family:system-ui,sans-serif;height:100%;overflow:hidden}
+          .stage{height:100%;display:flex;flex-direction:column}.label{padding:13px 16px 4px;color:#57e3c3;font-weight:700;font-size:14px}
+          svg{width:100%;flex:1;min-height:190px;display:block}.warning{padding:8px 14px 15px;font-size:12px;color:#a7c9c6;line-height:1.4}
+          </style></head><body><div class="stage"><div class="label">TURZX 風格 · 多車道 3D 示意</div>
+          <svg viewBox="0 0 660 310" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">
+          <defs><linearGradient id="r" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#294653"/><stop offset="1" stop-color="#10232c"/></linearGradient><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#1b9479" stop-opacity=".14"/><stop offset="1" stop-color="#41ffb5" stop-opacity=".55"/></linearGradient></defs>
+          <path d="M230 23 L430 23 L655 310 L5 310Z" fill="url(#r)"/><path d="M300 23 L360 23 L437 310 L223 310Z" fill="url(#g)"/>
+          <g stroke="#b3e6e0" stroke-width="3" opacity=".9"><path d="M278 23 L154 310" stroke-dasharray="14 13"/><path d="M382 23 L506 310" stroke-dasharray="14 13"/></g>
+          <path d="M230 23 L5 310 M430 23 L655 310" stroke="#47be9e" stroke-width="5" opacity=".65"/>
+          <g fill="#4c8185" stroke="#abffff" stroke-width="2"><path d="M309 205 L351 205 L366 270 L294 270Z"/><path d="M320 164 L339 164 L348 206 L311 206Z"/></g>
+          <g stroke="#8dfacb" stroke-width="2" opacity=".7"><path d="M323 185 Q330 135 330 40" stroke-dasharray="9 7"/></g>
+          <text x="26" y="30" fill="#58ebc1" font-size="15">3D VIEW / PREVIEW</text><text x="26" y="54" fill="#b0c6c9" font-size="12">非即時道路模型</text>
+          </svg><div class="warning">這是畫面配置示意，尚未串接 C4 的 modelV2 車道位置、前車與校正參數；不可當作可變換車道或避障的依據。</div></div></body></html>'''
+          
+          methods = '''    // v4.9.3: read-only portrait/landscape camera controls and TPMS popup.
+              private fun npInstallCameraControls() {
+                  val sizes = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                  listOf("S", "M", "L", "全螢幕").forEachIndexed { index, label ->
+                      sizes.addView(button(label, if (index == 2) blue else panelColor) { npSetCameraSize(index) },
+                          LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                  }
+                  cameraPanel.addView(sizes, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(38)))
+                  val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                  actions.addView(button("完整 Fit") { npSetCameraFill(false) }, LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                  actions.addView(button("填滿 Fill", blue) { npSetCameraFill(true) }, LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                  actions.addView(button("TPMS 放大") { npShowTpms() }, LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                  actions.addView(button("3D 預覽") { npShow3dPreview() }, LinearLayout.LayoutParams(0, dp(34), 1f))
+                  cameraPanel.addView(actions, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(38)))
+              }
+          
+              private fun npSetCameraSize(size: Int) {
+                  layoutPrefs().edit().putInt("np_video_size", size).apply()
+                  chooseDisplayMode(if (size == 3) 3 else if (size == 2) 2 else 1)
+              }
+          
+              private fun npSetCameraFill(fill: Boolean) {
+                  layoutPrefs().edit().putBoolean("np_camera_fill", fill).apply()
+                  if (::carrot.isInitialized && cameraLive && isSameCarrot(carrot.url.orEmpty())) {
+                      carrot.evaluateJavascript("window.__npCameraFill && window.__npCameraFill(" + fill.toString() + ");", null)
+                  }
+                  Toast.makeText(this, if (fill) "已選填滿（可能裁切畫面邊緣）" else "已選完整顯示（可能保留黑邊）", Toast.LENGTH_SHORT).show()
+              }
+          
+              private fun npShowTpms() {
+                  if (!cameraLive || !::carrot.isInitialized || !isSameCarrot(carrot.url.orEmpty())) {
+                      Toast.makeText(this, "請先連接 C4 Carrot Web", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  carrot.evaluateJavascript("window.__npTpmsToggle && window.__npTpmsToggle();", null)
+              }
+          
+              private fun npShow3dPreview() {
+                  val preview = WebView(this).apply {
+                      settings.javaScriptEnabled = false
+                      setBackgroundColor(Color.rgb(8, 22, 29))
+                      loadDataWithBaseURL(null, ''' + json.dumps(html, ensure_ascii=False) + ''', "text/html", "UTF-8", null)
+                  }
+                  AlertDialog.Builder(this).setTitle("多車道 3D HUD（示意）").setView(preview)
+                      .setPositiveButton("關閉", null).show()
+              }
+          
+          '''
+          once('    private fun connectCarrot() {', methods + '    private fun connectCarrot() {', 'v493 UI helpers')
+          
+          # JS is sourced from a pinned asset saved in the workflow's temporary workspace.
+          js = Path('/tmp/np_carrot_ui_v493.js').read_text(encoding='utf-8')
+          if '$' in js:
+              raise RuntimeError('Javascript should not include Kotlin interpolation dollar signs')
+          js_literal = json.dumps(js, ensure_ascii=False)
+          old = 'carrot.evaluateJavascript(script + ";window.__npSetCarrotVisionOnly(" + carrotVisionOnlyEnabled().toString() + ");", null)'
+          new = ('val npScript = ' + js_literal + '\n'
+                 '                  carrot.evaluateJavascript(script + ";window.__npSetCarrotVisionOnly(" + '
+                 'carrotVisionOnlyEnabled().toString() + ");" + npScript + '
+                 '";window.__npCameraFill(" + layoutPrefs().getBoolean("np_camera_fill", true).toString() + ");", null)')
+          once(old, new, 'Carrot Web pure stage plus Fit/Fill and TPMS JS')
+          p.write_text(s, encoding='utf-8')
+          
+          build = Path('app/build.gradle.kts')
+          g = build.read_text(encoding='utf-8')
+          assert g.count('versionName = "4.9.2-carrot-vision-only"') == 1
+          assert 'applicationIdSuffix = ".taiwan"' in g
+          assert 'signingConfig = signingConfigs.getByName("release")' in g
+          g = g.replace('versionName = "4.9.2-carrot-vision-only"', 'versionName = "4.9.3-responsive-tpms-3d-preview"', 1)
+          g, n = re.subn(r'versionCode = (\d+)', lambda m: 'versionCode = ' + str(int(m.group(1)) + 1000000), g, count=1)
+          assert n == 1
+          build.write_text(g, encoding='utf-8')
+          
+          manifest = Path('app/src/debug/AndroidManifest.xml')
+          m = manifest.read_text(encoding='utf-8')
+          assert m.count('NaviPilot Taiwan 4.9.2') == 1
+          manifest.write_text(m.replace('NaviPilot Taiwan 4.9.2', 'NaviPilot Taiwan 4.9.3', 1), encoding='utf-8')
+          print('v4.9.3: responsive S/M/L/Full camera, Fit/Fill toggle, independent TPMS popup, 3D demo only')
+          NP_PATCH_493_PY
+          python3 -m py_compile /tmp/np_patch_v493.py
+          python3 /tmp/np_patch_v493.py
+
+      - name: Compact v4.9.4 camera controls (hide controls by default)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/np_patch_v494.py <<'NP_PATCH_494_PY'
+          #!/usr/bin/env python3
+          # NaviPilot Taiwan v4.9.4: collapse camera buttons
+          from pathlib import Path
+          import re
+          p=Path('app/src/main/java/com/jixiexiaoge/drivingassist/TaiwanDashActivity.kt')
+          s=p.read_text(encoding='utf-8')
+          # Keep existing network, car-side stream, navigation, and TPMS code unchanged.
+          pattern=r'    private fun npInstallCameraControls\(\) \{[\s\S]*?\n    \}\n\n    private fun npSetCameraSize\(size: Int\) \{'
+          replacement='''    private lateinit var npCameraOptionDeck: LinearLayout
+          
+              private fun npInstallCameraControls() {
+                  // Compact access in the existing camera header, never across the live camera.
+                  val header = cameraPanel.getChildAt(0) as? LinearLayout
+                  header?.addView(button("選項") { npToggleCameraOptions() },
+                      LinearLayout.LayoutParams(dp(58), dp(38)))
+                  npCameraOptionDeck = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      visibility = View.GONE
+                  }
+                  val sizes = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  listOf("S", "M", "L", "全螢幕").forEachIndexed { index, label ->
+                      val selected = layoutPrefs().getInt("np_video_size", 2) == index
+                      sizes.addView(button(label, if (selected) blue else panelColor) { npSetCameraSize(index) },
+                          LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                  }
+                  npCameraOptionDeck.addView(sizes,
+                      LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(38)))
+                  val actions = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  actions.addView(button("完整 Fit") { npSetCameraFill(false); npHideCameraOptions() },
+                      LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                  actions.addView(button("填滿 Fill") { npSetCameraFill(true); npHideCameraOptions() },
+                      LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                  actions.addView(button("TPMS 放大") { npHideCameraOptions(); npShowTpms() },
+                      LinearLayout.LayoutParams(0, dp(34), 1f).apply { rightMargin = dp(3) })
+                  actions.addView(button("3D 示意") { npHideCameraOptions(); npShow3dPreview() },
+                      LinearLayout.LayoutParams(0, dp(34), 1f))
+                  npCameraOptionDeck.addView(actions,
+                      LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(38)))
+                  cameraPanel.addView(npCameraOptionDeck,
+                      LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT))
+              }
+          
+              private fun npToggleCameraOptions() {
+                  if (!::npCameraOptionDeck.isInitialized) return
+                  npCameraOptionDeck.visibility = if (npCameraOptionDeck.visibility == View.VISIBLE)
+                      View.GONE else View.VISIBLE
+              }
+          
+              private fun npHideCameraOptions() {
+                  if (::npCameraOptionDeck.isInitialized) npCameraOptionDeck.visibility = View.GONE
+              }
+          
+              private fun npSetCameraSize(size: Int) {'''
+          s,n=re.subn(pattern,lambda _:replacement,s,count=1)
+          assert n==1, f'Missing v4.9.3 camera toolbar method ({n})'
+          # Close the expanded controls after a user chooses any size.
+          old='''    private fun npSetCameraSize(size: Int) {
+                            layoutPrefs().edit().putInt("np_video_size", size).apply()'''
+          # Indentation generated from v4.9.3 patch can vary; locate statement instead of rewriting logic.
+          m=re.search(r'(private fun npSetCameraSize\(size: Int\) \{\s*)(layoutPrefs\(\)\.edit\(\)\.putInt\("np_video_size", size\)\.apply\(\))',s)
+          assert m, 'Missing v4.9.3 video size setter'
+          s=s[:m.start(2)]+'npHideCameraOptions()\n        '+s[m.start(2):]
+          p.write_text(s,encoding='utf-8')
+          
+          b=Path('app/build.gradle.kts');g=b.read_text(encoding='utf-8')
+          assert g.count('versionName = "4.9.3-responsive-tpms-3d-preview"') == 1
+          g=g.replace('versionName = "4.9.3-responsive-tpms-3d-preview"','versionName = "4.9.4-compact-camera-toolbar"',1)
+          g,n=re.subn(r'versionCode = (\d+)',lambda m:'versionCode = '+str(int(m.group(1))+1000000),g,count=1)
+          assert n==1
+          b.write_text(g,encoding='utf-8')
+          m=Path('app/src/debug/AndroidManifest.xml');v=m.read_text(encoding='utf-8')
+          assert v.count('NaviPilot Taiwan 4.9.3') == 1
+          m.write_text(v.replace('NaviPilot Taiwan 4.9.3','NaviPilot Taiwan 4.9.4',1),encoding='utf-8')
+          print('v4.9.4: collapsible camera controls; original TPMS & navigation retained')
+          NP_PATCH_494_PY
+          python3 -m py_compile /tmp/np_patch_v494.py
+          python3 /tmp/np_patch_v494.py
+
+      - name: Compile stable signed v4.9.4 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Verify signed package identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)
+          test -n "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | grep -F "package: name='com.jixiexiaoge.drivingassist.taiwan'"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
+          echo 'Verified stable ID and APK signing.'
+
+      - name: Upload signed NaviPilot v4.9.4 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NaviPilot-Taiwan-Dashboard-v494-signed
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
